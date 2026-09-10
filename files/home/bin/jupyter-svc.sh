@@ -27,6 +27,14 @@ ROOT=${WORKSPACE_DIR:-$HOME/workspace}
 mkdir -p "$RTC" "$ROOT"
 TOKEN=$(cat "$HOME/.jupyter-token")
 
+# Launch from the workspace so the server process cwd IS the notebook root.
+# root_dir (below) already governs where notebooks and kernels open, but a
+# JupyterLab *terminal* inherits the server process cwd when the frontend
+# doesn't pin one -- and the detached startup dispatcher starts this script
+# in /home/agent/workspace, an unrelated image dir.  Without this cd a
+# terminal would open there while kernels open in the workspace mount.
+cd "$ROOT" || exit 1
+
 delay=1
 while true; do
     start=$SECONDS
