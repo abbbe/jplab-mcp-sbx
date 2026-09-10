@@ -26,7 +26,6 @@ BRIDGE_VERSION="2.8.0"
 JAR=""
 INSTALLER=""
 LICENSE_FILE=""
-TOKEN=""
 RESEED=0
 
 usage() {
@@ -48,7 +47,6 @@ Usage: $0 (--installer PATH | --jar PATH) [options]
   --root DIR             Staging root (default: \$HOME/.sbx/burp)
   --bridge-version VER   fwaeytens/burp-mcp-bridge release (default: $BRIDGE_VERSION)
   --license-file FILE    File containing your Burp licence key (else prompted)
-  --token STRING         Preset the shared sandbox token instead of generating one
   --reseed               Copy the live Burp configs from state/ back over this
                          kit's *.seed.json, re-parameterising absolute paths.
                          Run it after changing settings in the Burp GUI.
@@ -62,7 +60,6 @@ while [ $# -gt 0 ]; do
         --root) ROOT="${2:?}"; shift 2 ;;
         --bridge-version) BRIDGE_VERSION="${2:?}"; shift 2 ;;
         --license-file) LICENSE_FILE="${2:?}"; shift 2 ;;
-        --token) TOKEN="${2:?}"; shift 2 ;;
         --reseed) RESEED=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -223,9 +220,6 @@ chmod 600 "$ROOT/dist/license.key"
 
 # --- what to run ----------------------------------------------------------
 REPO_ROOT="$(cd "$KIT_DIR/../.." && pwd)"
-tokarg=""
-[ -n "$TOKEN" ] && tokarg=" \\
-    --kit-arg token=$TOKEN"
 
 cat <<EOF
 
@@ -237,31 +231,19 @@ $([ -f "$ROOT/dist/burpsuite_pro.jar" ] && printf '    dist/burpsuite_pro.jar   
     dist/license.key            (0600)
     state/                      empty until first run; holds the activation
 
-Create the sandbox with:
+This script stages artefacts and stops there; creating and driving the sandbox
+belongs to the wrapper, which owns the kit list, the mounts, the shared token and
+the host ports:
 
-  sbx run --detached claude --name burpbox . \\
-    $ROOT/dist:ro \\
-    $ROOT/state \\
-    --kit $REPO_ROOT/kits/jupyter \\
-    --kit $REPO_ROOT/kits/desktop \\
-    --kit $REPO_ROOT/kits/burp \\
-    --kit-arg sbx-burp.dist=$ROOT/dist \\
-    --kit-arg sbx-burp.state=$ROOT/state$tokarg \\
-    -m 8g \\
-    -p 8888:8888 -p 6080:6080 -p 18080:8080
+    $REPO_ROOT/bin/sbx-kits up
 
-The sandbox's Burp proxy is published on host port 18080, NOT 8080: anyone using
-this kit very likely has a Burp of their own already listening on 127.0.0.1:8080,
-and sbx fails the whole create with "address already in use" rather than picking
-another port. Point external clients at 127.0.0.1:18080. Inside the sandbox the
-listener is still on 8080, so via-burp and the proxied Jupyter kernel are unaffected.
+    $REPO_ROOT/bin/sbx-kits status      # what is up
+    $REPO_ROOT/bin/sbx-kits urls        # URLs and token again
 
-Then, inside it:
-    sbx exec burpbox desktopctl url          # noVNC URL and password
-    sbx exec burpbox burp-start.sh           # first run: EULA + licence wizard
+First Burp start needs a terminal -- its EULA and licence prompts are a console
+conversation, not a GUI wizard:
 
-And for each target you intend to test (egress is default-deny):
-    sbx policy allow network --sandbox burpbox "target.example.com:443"
+    sbx exec -it <name> /home/agent/bin/burp-start.sh
 
 Your licence key is in $ROOT/dist/license.key -- inside the sandbox it is at
 the same path, so you can cat it in a noVNC terminal and paste it into the

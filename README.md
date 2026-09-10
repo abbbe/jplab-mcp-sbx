@@ -14,26 +14,31 @@ JupyterLab is there for scripting.
 Kits are composed at **create** time — `sbx kit add` on a running sandbox silently skips
 `ports:` and `volumes:`, so a kit added later has nothing published.
 
-## JupyterLab only
+## Use the wrapper
+
+`bin/sbx-kits` composes the `sbx run` invocation and owns the parts no kit can: the shared
+token, and fixed host ports.
 
 ```console
 git clone https://github.com/abbbe/jplab-mcp-sbx ~/.sbx/sbx-kits
-sbx run --detached claude --name jlcc . --kit ~/.sbx/sbx-kits/kits/jupyter -p 8888:8888
+~/.sbx/sbx-kits/bin/sbx-kits up            # creates a sandbox named after $PWD
+~/.sbx/sbx-kits/bin/sbx-kits status        # sandbox state + per-service health
+~/.sbx/sbx-kits/bin/sbx-kits urls          # URLs and token again
+~/.sbx/sbx-kits/bin/sbx-kits shell         # a shell inside it
 ```
 
-```
-  Published 127.0.0.1:8888 -> 8888/tcp4
-  Published jupyterlab: localhost:49160 -> 8888/tcp
-```
+`up` prints the noVNC and JupyterLab URLs with the token filled in. Defaults live in
+`~/.config/sbx-kits/config` (plain `KEY=value`), so `KITS=jupyter,desktop` or `MEMORY=12g`
+there beats retyping flags. `--dry-run` prints the `sbx run` it would execute.
 
-Either port works; 8888 is the stable one across restarts. `--detached` is needed once, at
-creation: without it the sandbox stops 30 seconds after the last session disconnects.
+JupyterLab only: `sbx-kits up notebook --kits jupyter`.
 
-Get the token and open `http://localhost:8888/lab?token=<token>`:
-
-```console
-sbx exec jlcc cat /home/agent/.sbx-token
-```
+The wrapper exists because the raw invocation is a dozen arguments, three of which must be
+byte-identical to two others — an additional workspace mounts at its identical host path and
+a kit cannot read the mount table, so each staged path has to be passed twice. It also always
+passes `--detached`, without which the sandbox stops 30 seconds after the last session
+disconnects, and it shifts off a busy host port rather than letting `sbx run` fail the whole
+create with a 409.
 
 ## Everything, including Burp
 
@@ -58,27 +63,28 @@ warning. `--jar` still works as a fallback and warns about the browser.
 The install runs unattended on first `burp-start.sh`, into `state/burp-install` — about 950 MB,
 paid once, and it survives `sbx rm` with the rest of the state mount.
 
-It prints the exact `sbx run` line, with your paths already substituted. Then:
+Then create the sandbox and do the one interactive step:
 
 ```console
-sbx exec burpbox /home/agent/bin/desktopctl url    # noVNC URL + password
-sbx exec burpbox /home/agent/bin/burp-start.sh     # first run: EULA, then licence wizard
+./bin/sbx-kits up burpbox
+sbx exec -it burpbox /home/agent/bin/burp-start.sh   # first run: EULA, then licence
 ```
 
-(Absolute paths because `sbx exec` does not run a login shell, so `~/bin` may not be on `PATH`.
-From a shell inside the sandbox the bare names usually work.)
-
-The licence wizard is GUI-only — there is no command-line activation — so it happens once, in
-the noVNC window. `dist/license.key` is at the same path inside the sandbox, so you can `cat`
-it in a terminal there and paste. After that the activation lives in `state/java` on the host
+Burp's first run is a console conversation, not a GUI wizard: it prints the EULA and blocks on
+stdin, so it needs a terminal — that is why the command above uses `sbx exec -it`.
+`dist/license.key` is at the same path inside the sandbox, so you can `cat` it there and paste. After that the activation lives in `state/java` on the host
 and survives `sbx rm`.
 
 ## One token
 
 There is a single secret per sandbox at `/home/agent/.sbx-token`. Whichever kit's install step
-runs first creates it and the rest reuse it, so any subset of the kits composes. Preset it with
-`--kit-arg token=<value>` (which applies to every kit at once) or `-e SBX_TOKEN=<value>`;
-otherwise it is random.
+runs first creates it and the rest reuse it, so any subset of the kits composes.
+
+`sbx-kits up` generates it on the host, keeps it under `~/.local/state/sbx-kits/<name>.token`,
+and pins it with `--kit-arg token=`. That matters for two reasons: `sbx run` surfaces no install
+or startup output, so a sandbox has nowhere to announce a token it generated itself; and
+`/home/agent/.sbx-token` is container overlay, so an `sbx kit add` container swap would
+otherwise regenerate it and silently change your VNC password mid-session.
 
 JupyterLab uses it as its access token and the desktop as its VNC password. Note the RFB
 protocol truncates VNC passwords to **eight characters**, so the desktop is only ever protected
@@ -138,8 +144,9 @@ redirects nothing by itself.
 ## Lifecycle
 
 ```console
-sbx stop jlcc          # stop
-sbx exec jlcc true     # start again without spawning the Claude TUI
+sbx-kits down burpbox      # stop
+sbx-kits wake burpbox      # start again without spawning the Claude TUI
+sbx-kits destroy burpbox   # remove it (host-staged Burp state is untouched)
 ```
 
 Burp does not come back by itself after a restart — run `burp-start.sh` again. The desktop and
@@ -147,6 +154,7 @@ JupyterLab do.
 
 ## Memory
 
-A mixin cannot raise the sandbox's memory limit, so pass it yourself: `-m 8g` when Burp is in
-the mix. Burp runs with `-XX:MaxRAMPercentage=50`, which reads the cgroup limit, so it tracks
-whatever you give the sandbox.
+A mixin cannot raise the sandbox's memory limit, so it has to come from the command line;
+`sbx-kits up` passes `-m 8g` by default (`--memory`, or `MEMORY=` in the config file). Burp runs
+with `-XX:MaxRAMPercentage=50`, which reads the cgroup limit, so it tracks whatever the sandbox
+was given without the kit knowing the number.

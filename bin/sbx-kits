@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# sbx-kits -- compose and drive a sandbox built from the kits in this repo.
+#
+# WHY THIS EXISTS.  The raw invocation is a dozen arguments, and three of them
+# must be BYTE-IDENTICAL to two others:
+#
+#   sbx run --detached claude --name burpbox . \
+#     ~/.sbx/burp/dist:ro ~/.sbx/burp/state \
+#     --kit .../kits/jupyter --kit .../kits/desktop --kit .../kits/burp \
+#     --kit-arg sbx-burp.dist=~/.sbx/burp/dist \
+#     --kit-arg sbx-burp.state=~/.sbx/burp/state \
+#     -m 8g -p 8888:8888 -p 6080:6080 -p 18080:8080
+#
+# The duplication is not gratuitous -- an additional workspace mounts at its
+# identical host path and a kit cannot read the mount table, so the path has to
+# be told to the kit separately.  But it is exactly the kind of thing a human
+# gets wrong at 1am, and it fails late and unhelpfully when they do.  Composing
+# it here makes the mismatch impossible by construction.
+#
+# It also owns the two things no kit can own:
+#
+#   THE SHARED TOKEN.  /home/agent/.sbx-token is container overlay, so a kit
+#   letting the sandbox generate its own means (a) the only way to learn it is
+#   to exec into a sandbox that already exists, because `sbx run` surfaces no
+#   install or startup output, and (b) a `sbx kit add` container swap silently
+#   regenerates it and changes the noVNC password and JupyterLab token
+#   underneath you.  Generated here, pinned with --kit-arg, printed at create.
+#
+#   HOST PORTS.  A kit-declared port is auto-published, but only on an ephemeral
+#   host port that is REALLOCATED ON RESTART (measured: 49166/67/68 became
+#   49169/70/71 after one stop/start, old numbers dead).  So fixed -p mappings
+#   are what make a bookmark work, and picking them has to cope with the fact
+#   that anyone using the burp kit already has a Burp on 8080.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}/sbx-kits"
+
+# Defaults, overridable per-invocation or from the config file below.
+NAME=""
+WORKSPACE="$PWD"
+KITS="jupyter,desktop,burp"
+BURP_ROOT="$HOME/.sbx/burp"
+MEMORY="8g"
+CPUS=""
+PORT_JUPYTER=8888
+PORT_NOVNC=6080
+PORT_BURP=18080          # host side; the sandbox listener is always 8080
+
+# ~/.config/sbx-kits/config is sourced if present: plain KEY=value bash, so
+# `MEMORY=12g` or `KITS=jupyter,desktop` there beats retyping flags.
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/sbx-kits/config"
+# shellcheck source=/dev/null
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+die() { echo "sbx-kits: $*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+Usage: sbx-kits <command> [NAME] [options]
+
+Commands:
+  up [NAME]        Create the sandbox and print its URLs
+  urls [NAME]      Print the URLs and token again
+  status [NAME]    Sandbox state, published ports, and per-service health
+  shell [NAME]     Interactive shell inside the sandbox
+  wake [NAME]      Start a stopped sandbox without spawning the Claude TUI
+  down [NAME]      Stop the sandbox
+  destroy [NAME]   Remove the sandbox (host-staged Burp state is NOT touched)
+
+Options (for 'up'):
+  --workspace DIR    Project directory to mount    (default: \$PWD)
+  --kits LIST        Comma-separated              (default: $KITS)
+  --burp-root DIR    Burp staging root            (default: $BURP_ROOT)
+  --memory SIZE      Sandbox memory               (default: $MEMORY)
+  --cpus N           Sandbox CPUs                 (default: sbx's own)
+  --token STRING     Pin the shared token         (default: generate and keep)
+  --dry-run          Print the sbx command instead of running it
+
+NAME defaults to the workspace directory name. Config file: $CONFIG
+EOF
+}
+
+# --- argument parsing ------------------------------------------------------
+CMD="${1:-}"; [ $# -gt 0 ] && shift || true
+case "$CMD" in
+    ""|-h|--help|help) usage; exit 0 ;;
+esac
+# A bare first argument that is not a flag is the sandbox name.
+if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then NAME="$1"; shift; fi
+
+TOKEN=""
+DRY_RUN=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --workspace) WORKSPACE="${2:?}"; shift 2 ;;
+        --kits) KITS="${2:?}"; shift 2 ;;
+        --burp-root) BURP_ROOT="${2:?}"; shift 2 ;;
+        --memory|-m) MEMORY="${2:?}"; shift 2 ;;
+        --cpus) CPUS="${2:?}"; shift 2 ;;
+        --token) TOKEN="${2:?}"; shift 2 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown argument: $1 (try --help)" ;;
+    esac
+done
+
+WORKSPACE="$(cd "$WORKSPACE" 2>/dev/null && pwd)" || die "no such directory: $WORKSPACE"
+[ -n "$NAME" ] || NAME="$(basename "$WORKSPACE")"
+
+has_kit() { case ",$KITS," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+
+# --- the shared token ------------------------------------------------------
+# Kept per sandbox name, on the host, so `urls` can answer without execing into
+# anything and so a recreate reuses the same value.
+TOKEN_FILE="$STATE_HOME/$NAME.token"
+load_token() {
+    if [ -n "$TOKEN" ]; then
+        mkdir -p "$STATE_HOME"; printf '%s\n' "$TOKEN" > "$TOKEN_FILE"
+    elif [ -s "$TOKEN_FILE" ]; then
+        TOKEN="$(cat "$TOKEN_FILE")"
+    else
+        mkdir -p "$STATE_HOME"
+        TOKEN="$(head -c 18 /dev/urandom | base64 | tr -d '/+=')"
+        printf '%s\n' "$TOKEN" > "$TOKEN_FILE"
+    fi
+    chmod 600 "$TOKEN_FILE"
+}
+
+# --- host port selection ---------------------------------------------------
+# `sbx run` fails the WHOLE create with a 409 when a host port is taken -- it
+# does not fall back -- so shift off a busy port here rather than 12 arguments
+# later.  Measured: your own Burp on 127.0.0.1:8080 kills the create outright.
+port_busy() { timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
+pick_port() {
+    local want=$1 p=$1 n=0
+    while port_busy "$p"; do
+        n=$((n + 1)); p=$((want + n * 1000))
+        [ "$n" -gt 20 ] && die "no free host port near $want"
+    done
+    [ "$p" != "$want" ] && echo "sbx-kits: host port $want is busy; using $p" >&2
+    echo "$p"
+}
+
+sandbox_exists() { sbx ls 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$NAME"; }
+
+print_urls() {
+    load_token
+    cat <<EOF
+
+  noVNC       http://127.0.0.1:$PORT_NOVNC/vnc.html   password: $(printf '%s' "$TOKEN" | cut -c1-8)
+  JupyterLab  http://127.0.0.1:$PORT_JUPYTER/lab?token=$TOKEN
+EOF
+    has_kit burp && echo "  Burp proxy  127.0.0.1:$PORT_BURP  (sandbox-side listener is 8080)"
+    cat <<EOF
+
+The VNC password is the FIRST 8 CHARACTERS only -- the RFB protocol truncates it
+and throws the rest away, which is why these are bound to 127.0.0.1 and nowhere
+else.
+EOF
+}
+
+case "$CMD" in
+up)
+    sandbox_exists && die "sandbox '$NAME' already exists (try: sbx-kits urls $NAME, or destroy it first)"
+
+    KIT_ARGS=()
+    MOUNTS=()
+    for k in ${KITS//,/ }; do
+        [ -d "$REPO/kits/$k" ] || die "no kit at $REPO/kits/$k"
+        KIT_ARGS+=(--kit "$REPO/kits/$k")
+    done
+
+    if has_kit burp; then
+        # Fail here, with the fix, rather than letting burp-start.sh discover it
+        # after a five-minute create.
+        if [ ! -f "$BURP_ROOT/dist/burp-installer.sh" ] && [ ! -f "$BURP_ROOT/dist/burpsuite_pro.jar" ]; then
+            die "no Burp staged in $BURP_ROOT/dist -- run:
+    $REPO/kits/burp/stage-burp.sh --installer /path/to/burpsuite_linux_arm64_*.sh
+  (or drop 'burp' from --kits)"
+        fi
+        mkdir -p "$BURP_ROOT/state"
+        # :ro on dist, read-write on state. Mount modes are per-workspace, so
+        # the parent cannot be mounted once with both.
+        MOUNTS+=("$BURP_ROOT/dist:ro" "$BURP_ROOT/state")
+        # The same paths again, because a kit cannot read the mount table.
+        KIT_ARGS+=(--kit-arg "sbx-burp.dist=$BURP_ROOT/dist"
+                   --kit-arg "sbx-burp.state=$BURP_ROOT/state")
+    fi
+
+    load_token
+    KIT_ARGS+=(--kit-arg "token=$TOKEN")
+
+    PORT_JUPYTER=$(pick_port "$PORT_JUPYTER")
+    PORT_NOVNC=$(pick_port "$PORT_NOVNC")
+    PUBLISH=(-p "$PORT_JUPYTER:8888" -p "$PORT_NOVNC:6080")
+    if has_kit burp; then
+        PORT_BURP=$(pick_port "$PORT_BURP")
+        PUBLISH+=(-p "$PORT_BURP:8080")
+    fi
+
+    # --detached at CREATE is the auto-stop fix: without it the sandbox stops 30
+    # seconds after the last session disconnects, which kills anything you are
+    # using from a browser.
+    CMDLINE=(sbx run --detached claude --name "$NAME" "$WORKSPACE" "${MOUNTS[@]}"
+             "${KIT_ARGS[@]}" -m "$MEMORY")
+    [ -n "$CPUS" ] && CMDLINE+=(--cpus "$CPUS")
+    CMDLINE+=("${PUBLISH[@]}")
+
+    if [ "$DRY_RUN" = 1 ]; then printf '%q ' "${CMDLINE[@]}"; echo; exit 0; fi
+
+    echo "sbx-kits: creating '$NAME' with kits: $KITS"
+    "${CMDLINE[@]}"
+    print_urls
+    if has_kit burp; then
+        cat <<EOF
+Burp does not start with the sandbox. First run needs a terminal, because its
+EULA and licence prompts are a console conversation:
+
+    sbx exec -it $NAME /home/agent/bin/burp-start.sh
+EOF
+    fi
+    ;;
+
+urls)
+    sandbox_exists || die "no sandbox named '$NAME'"
+    print_urls
+    ;;
+
+status)
+    sbx ls 2>/dev/null | awk -v n="$NAME" 'NR==1 || $1==n'
+    echo
+    sandbox_exists || exit 0
+    sbx exec "$NAME" bash -lc '
+        for p in 8888:jupyterlab 6080:novnc 5900:x11vnc 8080:burp-proxy 8081:burp-mcp; do
+            port=${p%%:*}; name=${p##*:}
+            if timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+                printf "  %-12s %-5s up\n" "$name" "$port"
+            else
+                printf "  %-12s %-5s down\n" "$name" "$port"
+            fi
+        done' 2>/dev/null || true
+    ;;
+
+shell)   sandbox_exists || die "no sandbox named '$NAME'"; exec sbx exec -it "$NAME" bash -l ;;
+# `sbx exec <name> true` starts a stopped sandbox without spawning the agent TUI.
+wake)    exec sbx exec "$NAME" true ;;
+down)    exec sbx stop "$NAME" ;;
+destroy)
+    sandbox_exists || die "no sandbox named '$NAME'"
+    printf "Remove sandbox '%s'? Host-staged Burp state in %s is NOT touched. [y/N] " "$NAME" "$BURP_ROOT"
+    read -r a; case "$a" in y|Y) sbx rm "$NAME" ;; *) echo "aborted" ;; esac
+    ;;
+
+*) die "unknown command: $CMD (try --help)" ;;
+esac
