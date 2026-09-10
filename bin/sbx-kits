@@ -77,7 +77,8 @@ Options (for 'up'):
   --token STRING     Pin the shared token         (default: generate and keep)
   --dry-run          Print the sbx command instead of running it
 
-NAME defaults to the workspace directory name. Config file: $CONFIG
+NAME defaults to the sandbox mounting $PWD (for 'up': the directory name).
+Config file: $CONFIG
 EOF
 }
 
@@ -106,7 +107,55 @@ while [ $# -gt 0 ]; do
 done
 
 WORKSPACE="$(cd "$WORKSPACE" 2>/dev/null && pwd)" || die "no such directory: $WORKSPACE"
-[ -n "$NAME" ] || NAME="$(basename "$WORKSPACE")"
+
+# --- finding the sandbox ---------------------------------------------------
+# WITHOUT A NAME, RESOLVE BY WORKSPACE, NOT BY DIRECTORY NAME.  Guessing
+# basename($PWD) looks reasonable and is wrong the moment a sandbox is named
+# anything else -- `status` in a repo called jlab-mcp-sbx then filtered for a
+# sandbox of that name, found none, and printed a bare table header. Matching on
+# the mounted workspace answers the question actually being asked: "the sandbox
+# for this directory".  basename is the fallback for `up`, which is naming a
+# sandbox that does not exist yet.
+sbx_json() { sbx ls --json 2>/dev/null || echo '{"sandboxes":[]}'; }
+
+sandbox_names() {
+    sbx_json | python3 -c 'import json,sys
+for s in json.load(sys.stdin).get("sandboxes", []): print(s["name"])'
+}
+
+names_for_workspace() {
+    sbx_json | python3 -c 'import json,sys
+ws = sys.argv[1]
+for s in json.load(sys.stdin).get("sandboxes", []):
+    for w in s.get("workspaces", []):
+        if (w[:-3] if w.endswith(":ro") else w) == ws:
+            print(s["name"]); break' "$1"
+}
+
+if [ -z "$NAME" ]; then
+    matches="$(names_for_workspace "$WORKSPACE")"
+    count=$(printf '%s\n' "$matches" | grep -c . || true)
+    case "$count" in
+        1) NAME="$matches" ;;
+        0) NAME="$(basename "$WORKSPACE")" ;;
+        *) die "several sandboxes mount $WORKSPACE:
+$(printf '%s\n' "$matches" | sed 's/^/    /')
+  Name the one you mean." ;;
+    esac
+fi
+
+sandbox_exists() { sandbox_names | grep -qx "$NAME"; }
+
+require_sandbox() {
+    sandbox_exists && return 0
+    local all; all="$(sandbox_names)"
+    if [ -z "$all" ]; then
+        die "no sandbox named '$NAME', and none exist. Create one: sbx-kits up"
+    fi
+    die "no sandbox named '$NAME'. Existing sandboxes:
+$(printf '%s\n' "$all" | sed 's/^/    /')
+  Name one, or run sbx-kits up to create '$NAME'."
+}
 
 has_kit() { case ",$KITS," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
@@ -142,8 +191,6 @@ pick_port() {
     echo "$p"
 }
 
-sandbox_exists() { sbx ls 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$NAME"; }
-
 print_urls() {
     load_token
     cat <<EOF
@@ -162,7 +209,10 @@ EOF
 
 case "$CMD" in
 up)
-    sandbox_exists && die "sandbox '$NAME' already exists (try: sbx-kits urls $NAME, or destroy it first)"
+    sandbox_exists && die "sandbox '$NAME' already exists and mounts this workspace.
+  sbx-kits status $NAME    what is running
+  sbx-kits urls $NAME      its URLs and token
+  sbx-kits destroy $NAME   remove it first if you want a fresh one"
 
     KIT_ARGS=()
     MOUNTS=()
@@ -223,14 +273,14 @@ EOF
     ;;
 
 urls)
-    sandbox_exists || die "no sandbox named '$NAME'"
+    require_sandbox
     print_urls
     ;;
 
 status)
+    require_sandbox
     sbx ls 2>/dev/null | awk -v n="$NAME" 'NR==1 || $1==n'
     echo
-    sandbox_exists || exit 0
     sbx exec "$NAME" bash -lc '
         for p in 8888:jupyterlab 6080:novnc 5900:x11vnc 8080:burp-proxy 8081:burp-mcp; do
             port=${p%%:*}; name=${p##*:}
@@ -242,12 +292,12 @@ status)
         done' 2>/dev/null || true
     ;;
 
-shell)   sandbox_exists || die "no sandbox named '$NAME'"; exec sbx exec -it "$NAME" bash -l ;;
+shell)   require_sandbox; exec sbx exec -it "$NAME" bash -l ;;
 # `sbx exec <name> true` starts a stopped sandbox without spawning the agent TUI.
 wake)    exec sbx exec "$NAME" true ;;
 down)    exec sbx stop "$NAME" ;;
 destroy)
-    sandbox_exists || die "no sandbox named '$NAME'"
+    require_sandbox
     printf "Remove sandbox '%s'? Host-staged Burp state in %s is NOT touched. [y/N] " "$NAME" "$BURP_ROOT"
     read -r a; case "$a" in y|Y) sbx rm "$NAME" ;; *) echo "aborted" ;; esac
     ;;
