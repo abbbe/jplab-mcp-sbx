@@ -1,0 +1,97 @@
+schemaVersion: "2"
+kind: mixin
+name: jplab-mcp-sbx
+displayName: JupyterLab + MCP
+description: JupyterLab with RTC, and jupyter-mcp-server over stdio in MCP_SERVER mode.
+requires:
+  agent: claude
+
+environment:
+  variables:
+    JUPYTER_VENV: /opt/jupyter
+    JUPYTER_PORT: "8888"
+    JUPYTER_RTC_STATE: /home/agent/.local/state/jupyter-rtc
+
+ports:
+  - container: 8888
+    protocol: tcp
+    name: jupyterlab
+
+setup:
+  install:
+    # jupyter-mcp-server hard-depends on jupyter-collaboration>=5, which pulls
+    # jupyterlab>=4.6 — one install yields the whole stack. Do NOT add a
+    # separate jupyterlab install. PEP 668 (Ubuntu 26.04) makes a bare
+    # `pip install` fail; the venv is mandatory.
+    #
+    # The wheel ships etc/jupyter/jupyter_server_config.d/jupyter_mcp_server.json,
+    # which auto-enables the MCP *server extension* inside Jupyter — the unsafe
+    # JUPYTER_SERVER topology (writes .ipynb behind RTC's back when no browser
+    # tab is open). There is no upstream opt-out, so overwrite that file with an
+    # explicit disable: this covers even a manually launched `jupyter lab`,
+    # not just the supervised one (which also passes the disable flag).
+    - user: "0"
+      description: JupyterLab + MCP server in one venv; hard-disable the MCP server extension
+      command: |
+        set -e
+        uv venv /opt/jupyter
+        VIRTUAL_ENV=/opt/jupyter uv pip install --no-cache jupyter-mcp-server
+        install -d /opt/jupyter/etc/jupyter/jupyter_server_config.d
+        printf '%s\n' '{"ServerApp": {"jpserver_extensions": {"jupyter_mcp_server": false}}}' \
+          > /opt/jupyter/etc/jupyter/jupyter_server_config.d/jupyter_mcp_server.json
+        chmod -R a+rX /opt/jupyter
+    # RTC state lives in the container overlay (NOT a volume, NOT the bind
+    # mount): ystore and session store then survive stop/start together and
+    # die with `sbx rm` together. Splitting their lifetimes is what corrupts
+    # notebooks (see README).
+    - user: "0"
+      description: Per-sandbox token, RTC state dir, and script permissions
+      command: |
+        set -e
+        install -d -o agent -g agent -m 0755 /home/agent/.local /home/agent/.local/state
+        install -d -o agent -g agent -m 0700 /home/agent/.local/state/jupyter-rtc
+        head -c 18 /dev/urandom | base64 | tr -d '/+=' > /home/agent/.jupyter-token
+        chown agent:agent /home/agent/.jupyter-token
+        chmod 600 /home/agent/.jupyter-token
+        chown -R agent:agent /home/agent/bin
+        chmod +x /home/agent/bin/jupyter-svc.sh /home/agent/bin/jupyter-mcp.sh
+    # Install commands run synchronously at create, BEFORE the CLI attaches
+    # and launches the interactive claude session — registering here is
+    # race-free. Startup commands are fired by a detached dispatcher that
+    # races the session; never register MCP there.
+    #
+    # --scope user: visible from every cwd, independent of the workspace.
+    # `claude mcp add` is not idempotent (exits 1 on an existing name), hence
+    # `|| true` — matches the built-in claude kit's own gateway registration.
+    # JUPYTER_URL/JUPYTER_TOKEN are deliberately NOT baked in with -e: the
+    # wrapper reads the token file at spawn time, so it can never go stale.
+    - user: "agent"
+      description: Register the stdio MCP server with Claude (install-time, race-free)
+      command: |
+        set -e
+        export PATH="$HOME/.local/bin:$HOME/.claude/local:$PATH"
+        claude mcp add jupyter --scope user -- /home/agent/bin/jupyter-mcp.sh || true
+
+  startup:
+    # A single background command is not supervised — the script itself is a
+    # restart loop with backoff.
+    - user: "1000"
+      background: true
+      description: JupyterLab, supervised
+      command: ["/home/agent/bin/jupyter-svc.sh"]
+
+# For a mixin the base agent's CLAUDE.md gains a "## Kits" section pointing at
+# this content (progressive disclosure); `filename` is only used by sandbox
+# kits and is deliberately absent here.
+agentInstructions:
+  content: |
+    ## JupyterLab in this sandbox
+
+    JupyterLab runs on port 8888 with real-time collaboration (RTC) on.
+    Work with notebooks through the `jupyter` MCP server, never by editing
+    .ipynb files directly: a direct file write goes behind RTC's back and is
+    later pulled into any open browser tab wholesale, discarding unsaved
+    edits made there.
+
+    The notebook root is the mounted workspace. The access token is in
+    ~/.jupyter-token if you need to construct a URL for the UI.
