@@ -1,0 +1,150 @@
+schemaVersion: "2"
+kind: mixin
+name: sbx-desktop
+version: "0.1.0"
+displayName: Virtual desktop (Xvfb + noVNC)
+description: An X display, a window manager, and noVNC in front of it. Nothing else starts here.
+requires:
+  agent: claude
+
+args:
+  token:
+    default: ""
+    description: >-
+      Shared sandbox token, used here as the VNC password. Empty means
+      "generate one". Set it for every kit at once with --kit-arg token=<value>.
+
+environment:
+  variables:
+    # THIS KIT OWNS DISPLAY.  environment.variables merges across a composition
+    # as a union in which a conflicting key is an error, not a last-wins, so no
+    # other kit in this repo may declare it -- sbx-burp reads it with a default
+    # instead.  Exporting it sandbox-wide is the point: any GUI program started
+    # by hand or by the agent lands on the virtual display without ceremony.
+    DISPLAY: ":1"
+    VNC_GEOMETRY: "1920x1080"
+    VNC_DEPTH: "24"
+    NOVNC_PORT: "6080"
+    XDG_SESSION_TYPE: "x11"
+    DESKTOP_STATE: /home/agent/.local/state/desktop
+
+# The complete outbound contract for this kit: apt, and nothing else.
+# `apt-get update` refreshes EVERY configured source, not just the one the
+# package comes from, so a source the base template added can fail the whole
+# install -- hence download.docker.com on the *-docker templates.  Ubuntu hosts
+# amd64 on archive/security and arm64 on ports, so all three are listed and the
+# kit works on an Apple Silicon Mac and on x86 CI alike.
+permissions:
+  network:
+    allow:
+      - archive.ubuntu.com:80
+      - security.ubuntu.com:80
+      - ports.ubuntu.com:80
+      - download.docker.com:443
+
+ports:
+  - container: 6080
+    protocol: tcp
+    name: novnc
+  # 5900 is deliberately absent.  x11vnc binds loopback only, and the RFB
+  # protocol truncates its password to 8 characters -- publishing that port
+  # would offer a remote desktop to anything that can reach the host, behind
+  # eight characters.
+
+setup:
+  install:
+    # Identical, idempotent copy of the token bootstrap in every kit here, so
+    # any subset composes: the first kit in --kit order creates the file and the
+    # rest reuse it.  Inline rather than a shipped script on purpose -- a shared
+    # file under files/ would raise an overlay-ordering question this does not.
+    - user: "0"
+      description: Shared sandbox token (creates it, or reuses an existing one)
+      command: |
+        set -e
+        tok=/home/agent/.sbx-token
+        if [ ! -s "$tok" ]; then
+            preset='${{ kit.args.token }}'
+            [ -n "$preset" ] || preset="${SBX_TOKEN:-}"
+            [ -n "$preset" ] || preset="$(head -c 18 /dev/urandom | base64 | tr -d '/+=')"
+            umask 077
+            printf '%s' "$preset" > "$tok"
+            chown agent:agent "$tok"
+            chmod 600 "$tok"
+        fi
+    # The package list is abbbe/sbx-workspace's Dockerfile, unchanged, and two
+    # entries in it look like padding and are not:
+    #
+    #   xterm is never invoked by anything here.  fluxbox's generated
+    #   Applications menu offers Bash, Dash, Sh and Bc, and every one of those
+    #   entries runs x-terminal-emulator -- the Debian alternatives symlink.
+    #   With no package providing it the menu items are still listed, still
+    #   clickable, and DO NOTHING AT ALL: no window, no error, no log line,
+    #   because fluxbox does not report a failed exec.  xterm is the smallest
+    #   thing that registers the alternative.
+    #
+    #   feh is never invoked either.  fluxbox paints the root window by handing
+    #   its style's background to fbsetbg, and fbsetbg with no image-capable
+    #   setter installed pops an xmessage dialog -- one per fluxbox start, never
+    #   reaped, on a desktop the user is seeing for the first time.  Measured:
+    #   with feh present the dialog is gone; setting session.screen0.rootCommand
+    #   does NOT prevent it.  That dialog is also what exposed the pipeline bug
+    #   documented in desktop-svc.sh's keep_alive.
+    #
+    # libgl1-mesa-dri is not optional either even though nothing links it at
+    # build time: without the DRI drivers an OpenGL canvas on a software X
+    # server either falls back to an unaccelerated path or fails outright, and
+    # the application reports it as its own bug.  mesa-utils also supplies
+    # glxgears, which is the right way to verify the display -- xdpyinfo
+    # succeeds over connections a real GUI cannot use.
+    - user: "0"
+      description: X server, window manager, VNC, noVNC
+      command: |
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          xvfb x11vnc novnc websockify fluxbox \
+          feh xterm \
+          x11-utils x11-xserver-utils xauth dbus-x11 \
+          libgl1-mesa-dri mesa-utils \
+          fonts-dejavu fonts-liberation
+        rm -rf /var/lib/apt/lists/*
+    # chmod +x is load-bearing, not hygiene: files/ entries arrive 0644
+    # whatever their mode on disk, and an unexecutable startup command fails
+    # with Permission denied and reads as a broken kit.
+    - user: "0"
+      description: State directory and script permissions
+      command: |
+        set -e
+        install -d -o agent -g agent -m 0755 /home/agent/.local /home/agent/.local/state
+        install -d -o agent -g agent -m 0700 /home/agent/.local/state/desktop
+        chown -R agent:agent /home/agent/bin /home/agent/.fluxbox
+        chmod +x /home/agent/bin/desktop-svc.sh /home/agent/bin/desktopctl
+
+  startup:
+    # Not supervised from outside -- the script is its own restart loop, in the
+    # same register as jupyter-svc.sh.  Nothing re-applies a "desired state"
+    # after a stop/start cycle in this platform, so the desired state has to be
+    # "always on", which for ~60MB of RSS is the right trade.
+    - user: "1000"
+      background: true
+      description: Desktop, supervised
+      command: ["/home/agent/bin/desktop-svc.sh"]
+
+agentInstructions:
+  content: |
+    ## Virtual desktop
+
+    A 1920x1080 X display is on `:1`, mirrored to noVNC on port 6080. GUI
+    programs you start (`xterm &`) appear there; the human opens the URL from
+    `desktopctl url` in a browser. Only the first 8 characters of the password
+    matter -- the RFB protocol truncates it.
+
+    `desktopctl status` probes 5900 and 6080 separately, because a live
+    supervisor with a dead x11vnc still serves the noVNC page: the browser then
+    says "Failed to connect to server" and nothing else reports a problem.
+
+    If a GUI program refuses to start claiming a Wayland session, `unset
+    WAYLAND_DISPLAY` first -- the sandbox exports `WAYLAND_DISPLAY=wayland-0`
+    into every process and some X clients treat that variable alone as proof of
+    Wayland without ever looking at $DISPLAY.

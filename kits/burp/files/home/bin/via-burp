@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# via-burp COMMAND [ARGS...] -- run one command with its traffic through Burp.
+#
+# THE PROXY IS OPT-IN, PER COMMAND, AND MUST STAY THAT WAY.  Putting
+# HTTP_PROXY/HTTPS_PROXY in the kit's environment.variables would apply them to
+# every process in the sandbox, including Claude Code itself: this session's own
+# Anthropic API traffic would be routed through Burp, break on TLS, and drop its
+# credentials into the proxy history on the way past.
+#
+# The chain is client -> Burp :8080 -> the sbx egress proxy -> origin.  Burp's
+# own upstream hop is configured in its user config by burp-start.sh, not here.
+set -uo pipefail
+
+PROXY_PORT=${BURP_PROXY_PORT:-8080}
+CA=/usr/local/share/ca-certificates/burp.crt
+
+[ $# -gt 0 ] || { echo "usage: via-burp COMMAND [ARGS...]" >&2; exit 2; }
+
+if ! timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$PROXY_PORT" 2>/dev/null; then
+    # Without this check the wrapped command reports a connection refused, which
+    # reads as the target being down rather than Burp not running.
+    echo "via-burp: nothing is listening on 127.0.0.1:$PROXY_PORT -- run burp-start.sh" >&2
+    exit 1
+fi
+
+if [ ! -s "$CA" ]; then
+    echo "via-burp: $CA is missing; TLS through Burp will fail." >&2
+    echo "via-burp: re-run burp-start.sh once the Burp UI is up to install it." >&2
+fi
+
+export HTTP_PROXY="http://127.0.0.1:$PROXY_PORT"
+export HTTPS_PROXY="$HTTP_PROXY"
+export http_proxy="$HTTP_PROXY"
+export https_proxy="$HTTP_PROXY"
+# Loopback services and the agent's own control plane never go through Burp.
+export NO_PROXY="127.0.0.1,localhost,::1"
+export no_proxy="$NO_PROXY"
+
+export REQUESTS_CA_BUNDLE="$CA"
+export SSL_CERT_FILE="$CA"
+export CURL_CA_BUNDLE="$CA"
+export GIT_SSL_CAINFO="$CA"
+export NODE_EXTRA_CA_CERTS="$CA"
+
+exec "$@"

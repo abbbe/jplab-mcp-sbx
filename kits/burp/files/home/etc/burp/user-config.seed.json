@@ -1,0 +1,32 @@
+{
+  "user_options": {
+    "connections": {
+      "upstream_proxy": {
+        "servers": [
+          {
+            "enabled": true,
+            "destination_host": "*",
+            "proxy_host": "@PROXY_HOST@",
+            "proxy_port": 0,
+            "auth_type": "none"
+          }
+        ]
+      }
+    },
+    "extender": {
+      "extensions": [
+        {
+          "extension_type": "java",
+          "extension_file": "@BURP_DIST@/burp-mcp-bridge.jar",
+          "name": "Burp MCP Bridge",
+          "loaded": true,
+          "errors": "ui",
+          "output": "ui"
+        }
+      ]
+    },
+    "misc": {
+      "enable_proxy_interception_at_startup": "never"
+    }
+  }
+}

@@ -18,7 +18,7 @@ VENV=${JUPYTER_VENV:-/opt/jupyter}
 PORT=${JUPYTER_PORT:-8888}
 
 export JUPYTER_URL="http://127.0.0.1:$PORT"
-JUPYTER_TOKEN=$(cat "$HOME/.jupyter-token")
+JUPYTER_TOKEN=$(cat "${SBX_TOKEN_FILE:-$HOME/.sbx-token}")
 export JUPYTER_TOKEN
 
 for _ in $(seq 1 60); do

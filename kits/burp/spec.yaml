@@ -1,0 +1,196 @@
+schemaVersion: "2"
+kind: mixin
+name: sbx-burp
+version: "0.1.0"
+displayName: Burp Suite Professional
+description: Burp Pro on the virtual desktop, driven by Claude through burp-mcp-bridge over stdio.
+requires:
+  agent: claude
+
+# dist/ and state/ are staged on the HOST by stage-burp.sh and mounted in as
+# additional workspaces, which land at their IDENTICAL host path.  A mixin
+# cannot mount a host path itself (kit volumes: are container-local block
+# devices) and cannot read the mount table, so the paths have to be told to it
+# twice: once as a positional workspace and once as a kit arg.
+#
+# They have defaults rather than `required: true` so the kit still installs in a
+# bare probe sandbox with no staging present -- which is what makes the deny-all
+# network probe in the README possible.  burp-start.sh is where a missing stage
+# is reported, at length.
+args:
+  token:
+    default: ""
+    description: >-
+      Shared sandbox token. Empty means "generate one". Set it for every kit at
+      once with --kit-arg token=<value>.
+  dist:
+    default: /opt/burp/dist
+    description: >-
+      Host path of the read-only staged artefact directory (Burp jar, MCP bridge
+      jar, node bridge, licence key) written by stage-burp.sh.
+  state:
+    default: /opt/burp/state
+    description: >-
+      Host path of the read-write state directory (Java prefs and licence
+      activation, Burp project file, live configs, logs).
+
+environment:
+  variables:
+    BURP_DIST: "${{ kit.args.dist }}"
+    BURP_STATE: "${{ kit.args.state }}"
+    BURP_PROXY_PORT: "8080"
+    BURP_API_PORT: "8081"
+    # DISPLAY is deliberately absent: sbx-desktop owns it, and
+    # environment.variables merges as a union in which a conflicting key is a
+    # compose-time error rather than a last-wins.  The scripts here default it.
+    #
+    # HTTP_PROXY / HTTPS_PROXY are deliberately absent and must stay that way.
+    # A kit-level proxy variable applies to every process in the sandbox,
+    # including Claude Code -- this session's own Anthropic API traffic would go
+    # through Burp, break on TLS, and leave its credentials in the proxy
+    # history.  Routing traffic through Burp is opt-in, per command: via-burp.
+
+# The complete outbound contract.  apt-get update refreshes EVERY configured
+# source, so download.docker.com is needed on the *-docker templates even though
+# nothing here installs from it; ubuntu splits amd64 (archive/security) from
+# arm64 (ports), so all three are listed.
+#
+# portswigger.net is here ONLY for online licence activation.  Delete it and use
+# Burp's manual activation instead (it prints a URL you open in a browser on
+# your own machine) if you would rather portswigger.net were unreachable from a
+# sandbox that renders attacker-controlled responses.  Nothing else in this kit
+# needs it: the jars are staged from the host.
+permissions:
+  network:
+    allow:
+      - archive.ubuntu.com:80
+      - security.ubuntu.com:80
+      - ports.ubuntu.com:80
+      - download.docker.com:443
+      - portswigger.net:443
+
+ports:
+  - container: 8080
+    protocol: tcp
+    name: burp-proxy
+  # 8081 (the bridge's HTTP API) and 3000 (the bridge's own SSE listener, which
+  # burp-mcp.sh disables anyway) are deliberately absent.  Both are
+  # unauthenticated and both drive Burp.  The bridge reaches 8081 over loopback
+  # and Claude reaches the bridge over stdio; neither crosses the boundary.
+
+setup:
+  install:
+    # Identical, idempotent copy of the token bootstrap in every kit here.
+    - user: "0"
+      description: Shared sandbox token (creates it, or reuses an existing one)
+      command: |
+        set -e
+        tok=/home/agent/.sbx-token
+        if [ ! -s "$tok" ]; then
+            preset='${{ kit.args.token }}'
+            [ -n "$preset" ] || preset="${SBX_TOKEN:-}"
+            [ -n "$preset" ] || preset="$(head -c 18 /dev/urandom | base64 | tr -d '/+=')"
+            umask 077
+            printf '%s' "$preset" > "$tok"
+            chown agent:agent "$tok"
+            chmod 600 "$tok"
+        fi
+    # openjdk-21-jre, NOT -jre-headless.  Burp is a Swing application and the
+    # bridge extension registers UI when it loads; the headless JRE ships no AWT
+    # and Burp dies with a HeadlessException that reads as a Burp bug.  Burp
+    # needs Java 21 or later (PortSwigger's own stated minimum).
+    #
+    # node is guarded rather than assumed: the bridge is an ESM package wanting
+    # node >= 18.14.1, and whether the base template carries a node runtime
+    # depends on how Claude Code was installed into it.  Never install over one
+    # that is already on PATH -- two nodes is its own class of bug.
+    - user: "0"
+      description: A full JRE (not headless) and a Node runtime for the bridge
+      command: |
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends openjdk-21-jre ca-certificates openssl
+        command -v node >/dev/null 2>&1 || apt-get install -y --no-install-recommends nodejs
+        rm -rf /var/lib/apt/lists/*
+        java -version
+        node --version
+    # chmod +x is load-bearing: files/ entries arrive 0644 whatever their mode
+    # on disk, and an unexecutable MCP wrapper fails with Permission denied,
+    # which Claude reports as a broken MCP server.
+    - user: "0"
+      description: Script permissions and state directory
+      command: |
+        set -e
+        chown -R agent:agent /home/agent/bin /home/agent/etc
+        chmod +x /home/agent/bin/burp-start.sh /home/agent/bin/burp-mcp.sh /home/agent/bin/via-burp
+        install -d -o agent -g agent -m 0755 /home/agent/.local /home/agent/.local/state
+        install -d -o agent -g agent -m 0700 /home/agent/.local/state/burp
+    # Install commands run synchronously at create, BEFORE the CLI attaches and
+    # launches the interactive session -- registering here is race-free. Startup
+    # commands are fired by a detached dispatcher that races the session; never
+    # register MCP there.  `claude mcp add` is not idempotent, hence `|| true`.
+    - user: "agent"
+      description: Register the stdio MCP server with Claude (install-time, race-free)
+      command: |
+        set -e
+        export PATH="$HOME/.local/bin:$HOME/.claude/local:$PATH"
+        claude mcp add burp --scope user -- /home/agent/bin/burp-mcp.sh || true
+    # A SECOND Jupyter kernel whose environment routes through Burp, never the
+    # default one -- a notebook the agent writes for its own purposes must not
+    # be proxied.  Guarded on the venv existing so this kit still installs when
+    # composed without the jupyter kit.
+    - user: "0"
+      description: "Jupyter kernel 'Python 3 (via Burp)', only when the jupyter kit is composed in"
+      command: |
+        set -e
+        [ -x /opt/jupyter/bin/python ] || exit 0
+        d=/opt/jupyter/share/jupyter/kernels/python3-burp
+        install -d "$d"
+        cat > "$d/kernel.json" <<'EOF'
+        {"display_name": "Python 3 (via Burp)", "language": "python",
+         "argv": ["/opt/jupyter/bin/python", "-m", "ipykernel_launcher", "-f", "{connection_file}"],
+         "env": {"HTTP_PROXY": "http://127.0.0.1:8080",
+                 "HTTPS_PROXY": "http://127.0.0.1:8080",
+                 "REQUESTS_CA_BUNDLE": "/usr/local/share/ca-certificates/burp.crt",
+                 "SSL_CERT_FILE": "/usr/local/share/ca-certificates/burp.crt"}}
+        EOF
+        chmod -R a+rX "$d"
+
+  # No startup: block.  Burp is a 2-4GB JVM that most sessions do not want, and
+  # a mixin cannot raise the sandbox memory limit.  burp-start.sh starts it.
+
+agentInstructions:
+  content: |
+    ## Burp Suite Professional
+
+    Burp is NOT running. Start it with `burp-start.sh`, which returns once the
+    proxy (8080) and the bridge API (8081) both answer. It takes 30-60 seconds.
+
+    The `burp` MCP server is a stdio bridge that talks to 127.0.0.1:8081, which
+    only exists while Burp is up. If burp tools fail with a connection error,
+    run `burp-start.sh` and then `/mcp` in this session to reconnect.
+
+    ### Routing traffic through Burp
+    There is no global HTTP_PROXY and there must not be one -- it would send
+    this session's own Anthropic API traffic through Burp. Opt in per command:
+
+        via-burp curl -sS https://target.example.com/
+        via-burp python3 script.py
+
+    In JupyterLab, select the "Python 3 (via Burp)" kernel. Burp's CA is at
+    /usr/local/share/ca-certificates/burp.crt and in the system bundle once
+    burp-start.sh has run.
+
+    ### Never edit these by hand
+    $BURP_STATE/project.burp is a proprietary binary written by a live JVM.
+    $BURP_STATE/user-config.json and project-config.json are written back by
+    Burp when it exits; change those settings in the GUI, not in a text editor
+    while Burp is running.
+
+    ### If a target is unreachable
+    Egress is default-deny, and Burp's own traffic is subject to it, so the
+    sandbox doubles as a scope guard. `sbx policy check network <host>` states
+    the reason plainly. The fix is a host command -- there is no sbx inside a
+    sandbox:
+        sbx policy allow network --sandbox <name> "target.example.com:443"

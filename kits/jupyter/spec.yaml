@@ -1,16 +1,38 @@
 schemaVersion: "2"
 kind: mixin
-name: jplab-mcp-sbx
+name: sbx-jupyter
+version: "0.2.0"
 displayName: JupyterLab + MCP
 description: JupyterLab with RTC, and jupyter-mcp-server over stdio in MCP_SERVER mode.
 requires:
   agent: claude
+
+# One secret per sandbox, shared by every kit in this repo. See the token
+# bootstrap in setup.install below and README.md "One token".
+args:
+  token:
+    default: ""
+    description: >-
+      Shared sandbox token. Empty means "generate one". Set it for every kit at
+      once with --kit-arg token=<value>; the first kit to run creates the file
+      and the rest reuse it.
 
 environment:
   variables:
     JUPYTER_VENV: /opt/jupyter
     JUPYTER_PORT: "8888"
     JUPYTER_RTC_STATE: /home/agent/.local/state/jupyter-rtc
+
+# The complete outbound contract for this kit. Egress is default-deny, and an
+# install hook that reaches an undeclared host fails `sbx create` with an error
+# that names the package manager rather than the policy. `uv pip install` needs
+# PyPI; apt is not used here, so the ubuntu archives are deliberately absent.
+permissions:
+  network:
+    allow:
+      - pypi.org:443
+      - files.pythonhosted.org:443
+      - astral.sh:443
 
 ports:
   - container: 8888
@@ -19,6 +41,29 @@ ports:
 
 setup:
   install:
+    # THE SHARED TOKEN. Identical in all three kits and idempotent, so any
+    # subset of them composes: whichever kit is first in --kit order creates the
+    # file and the others take the `-s` branch. It is inline rather than a
+    # shipped script precisely so each kit stands alone -- a shared file under
+    # files/ would raise an overlay-ordering question that this does not have.
+    #
+    # Precedence: --kit-arg token=..., then -e SBX_TOKEN=..., then random.
+    # The --kit-arg path is the guaranteed one; whether `-e` reaches install
+    # hooks is unverified, so it is a convenience and not the contract.
+    - user: "0"
+      description: Shared sandbox token (creates it, or reuses an existing one)
+      command: |
+        set -e
+        tok=/home/agent/.sbx-token
+        if [ ! -s "$tok" ]; then
+            preset='${{ kit.args.token }}'
+            [ -n "$preset" ] || preset="${SBX_TOKEN:-}"
+            [ -n "$preset" ] || preset="$(head -c 18 /dev/urandom | base64 | tr -d '/+=')"
+            umask 077
+            printf '%s' "$preset" > "$tok"
+            chown agent:agent "$tok"
+            chmod 600 "$tok"
+        fi
     # jupyter-mcp-server hard-depends on jupyter-collaboration>=5, which pulls
     # jupyterlab>=4.6 — one install yields the whole stack. Do NOT add a
     # separate jupyterlab install. PEP 668 (Ubuntu 26.04) makes a bare
@@ -44,15 +89,16 @@ setup:
     # mount): ystore and session store then survive stop/start together and
     # die with `sbx rm` together. Splitting their lifetimes is what corrupts
     # notebooks (see README).
+    #
+    # chmod +x is load-bearing, not hygiene: files/ entries arrive 0644
+    # regardless of their mode on disk, and an unexecutable startup command
+    # fails with Permission denied and looks like a broken kit.
     - user: "0"
-      description: Per-sandbox token, RTC state dir, and script permissions
+      description: RTC state dir and script permissions
       command: |
         set -e
         install -d -o agent -g agent -m 0755 /home/agent/.local /home/agent/.local/state
         install -d -o agent -g agent -m 0700 /home/agent/.local/state/jupyter-rtc
-        head -c 18 /dev/urandom | base64 | tr -d '/+=' > /home/agent/.jupyter-token
-        chown agent:agent /home/agent/.jupyter-token
-        chmod 600 /home/agent/.jupyter-token
         chown -R agent:agent /home/agent/bin
         chmod +x /home/agent/bin/jupyter-svc.sh /home/agent/bin/jupyter-mcp.sh
     # Install commands run synchronously at create, BEFORE the CLI attaches
@@ -93,5 +139,5 @@ agentInstructions:
     later pulled into any open browser tab wholesale, discarding unsaved
     edits made there.
 
-    The notebook root is the mounted workspace. The access token is in
-    ~/.jupyter-token if you need to construct a URL for the UI.
+    The notebook root is the mounted workspace. The access token is the
+    sandbox-wide one in ~/.sbx-token if you need to construct a URL for the UI.

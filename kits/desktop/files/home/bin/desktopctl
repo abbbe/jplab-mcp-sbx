@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# desktopctl status | url | log [-f]
+#
+# STATUS PROBES THE PORTS, NOT THE SUPERVISOR.  A live supervisor with a dead
+# x11vnc still serves the noVNC page -- websockify is what serves it -- so the
+# only symptom is the browser saying "Failed to connect to server" while
+# everything else reports healthy.  5900 is the port that actually breaks;
+# 6080 keeps answering long after the VNC server behind it has gone.
+set -uo pipefail
+
+: "${NOVNC_PORT:=6080}"
+STATE="${DESKTOP_STATE:-$HOME/.local/state/desktop}"
+TOKEN_FILE=${SBX_TOKEN_FILE:-$HOME/.sbx-token}
+
+port_open() { timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
+
+case "${1:-status}" in
+status)
+    x11=stopped; novnc=stopped
+    port_open 5900 && x11=running
+    port_open "$NOVNC_PORT" && novnc=running
+    printf '%-12s %s\n' x11vnc:5900 "$x11"
+    printf '%-12s %s\n' "noVNC:$NOVNC_PORT" "$novnc"
+    if [[ $x11 == stopped && $novnc == running ]]; then
+        echo
+        echo "DEGRADED: the page will load and then fail to connect."
+        echo "  Look at the log:  desktopctl log"
+    fi
+    ;;
+url)
+    if [[ -s "$TOKEN_FILE" ]]; then
+        # Only the first 8 characters matter -- the RFB protocol truncates the
+        # password and discards the rest.  Printing the whole token here would
+        # invite someone to wonder why a 24-character secret "works" when
+        # mistyped past the 8th.
+        echo "http://127.0.0.1:$NOVNC_PORT/vnc.html    password: $(cut -c1-8 "$TOKEN_FILE")"
+    else
+        echo "no token file at $TOKEN_FILE" >&2; exit 1
+    fi
+    ;;
+log)
+    # The startup dispatcher owns this service's stdout; these are the component
+    # FIFOs it multiplexes, which is the best this can do without a log file.
+    shift || true
+    echo "desktop output goes to the sandbox startup log; component FIFOs are in $STATE" >&2
+    ls -l "$STATE" 2>/dev/null
+    ;;
+*)
+    echo "usage: desktopctl {status|url|log}" >&2; exit 1
+    ;;
+esac

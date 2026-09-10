@@ -25,7 +25,17 @@ RTC=${JUPYTER_RTC_STATE:-$HOME/.local/state/jupyter-rtc}
 ROOT=${WORKSPACE_DIR:-$HOME/workspace}
 
 mkdir -p "$RTC" "$ROOT"
-TOKEN=$(cat "$HOME/.jupyter-token")
+
+# ONE TOKEN PER SANDBOX, shared with every other kit in this repo (the desktop
+# uses the same string as its VNC password). Whichever kit's install step ran
+# first created it. Fail loudly rather than starting an unauthenticated
+# JupyterLab: an empty --IdentityProvider.token disables authentication.
+TOKEN_FILE=${SBX_TOKEN_FILE:-$HOME/.sbx-token}
+if [[ ! -s "$TOKEN_FILE" ]]; then
+    echo "[jupyter-svc] $TOKEN_FILE is missing or empty; refusing to start" >&2
+    exit 1
+fi
+TOKEN=$(cat "$TOKEN_FILE")
 
 # Launch from the workspace so the server process cwd IS the notebook root.
 # root_dir (below) already governs where notebooks and kernels open, but a
