@@ -30,10 +30,15 @@ TOKEN=$(cat "$HOME/.jupyter-token")
 delay=1
 while true; do
     start=$SECONDS
-    # 0.0.0.0, or a published port forwards to nothing: publishing reaches the
-    # sandbox on eth0, and a loopback-bound server never sees it.
+    # --ip='*' is jupyter_server's spelling for "bind all interfaces, BOTH
+    # address families" (it maps '*' to an empty bind address, and Tornado
+    # then binds v4 and v6).  Not 0.0.0.0: that is v4-only, and sbx publishes
+    # the host port on v4 AND v6 -- macOS tries ::1 first, reaches the host
+    # listener, and the forward dies inside the sandbox where nothing
+    # listens on v6.  Not loopback either: the published port arrives on
+    # eth0, which a loopback-bound server never sees.
     "$VENV/bin/jupyter" lab \
-        --ip=0.0.0.0 --port="$PORT" --no-browser \
+        --ip='*' --port="$PORT" --no-browser \
         --IdentityProvider.token="$TOKEN" \
         --ServerApp.root_dir="$ROOT" \
         --ServerApp.allow_remote_access=True \

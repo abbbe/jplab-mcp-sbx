@@ -5,10 +5,11 @@ A mixin kit for [Docker Sandboxes](https://docs.docker.com/) (`sbx`) that adds
 `jupyter-mcp-server`** to the stock `claude` agent sandbox. No custom image, no
 Dockerfile, no fork of anything.
 
+TLDR:
 ```console
-$ git clone
-$ sbx create claude /path/to/project --kit /path/to/jplab-mcp-sbx -p 8888:8888
-$ sbx run --name <sandbox>
+$ git clone https://github.com/abbbe/jplab-mcp-sbx ~/.sbx/jplab-mcp-sbx
+$ sbx create claude --name jlcc . --kit ~/.sbx/jplab-mcp-sbx -p 8888:8888
+$ sbx run --name jlcc
 ```
 
 Read the token with `sbx exec <sandbox> cat /home/agent/.jupyter-token`, then
@@ -98,7 +99,10 @@ unreachable** in a sandbox:
   instead of spawning its own.
 - **`jupyter-svc.sh` supervises JupyterLab** (restart loop with backoff — a
   single `background: true` startup command is otherwise unsupervised) and
-  binds `0.0.0.0` so the published port actually reaches it.
+  binds all interfaces on **both address families** (`--ip='*'`). Not
+  `0.0.0.0`: sbx publishes the host port on IPv4 *and* IPv6, macOS tries
+  `::1` first, and with a v4-only listener that connection reaches the host
+  forwarder but dies inside the sandbox.
 
 ## Files
 
