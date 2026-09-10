@@ -60,7 +60,11 @@ setup:
             [ -n "$preset" ] || preset="${SBX_TOKEN:-}"
             [ -n "$preset" ] || preset="$(head -c 18 /dev/urandom | base64 | tr -d '/+=')"
             umask 077
-            printf '%s' "$preset" > "$tok"
+            # Newline-terminated so `cat ~/.sbx-token` does not run into the
+            # next prompt. Every consumer reads it through $(cat ...) or
+            # $(cut ...), and command substitution strips trailing newlines,
+            # so the value itself is unchanged.
+            printf '%s\n' "$preset" > "$tok"
             chown agent:agent "$tok"
             chmod 600 "$tok"
         fi

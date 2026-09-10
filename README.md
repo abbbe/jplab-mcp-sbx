@@ -38,12 +38,25 @@ sbx exec jlcc cat /home/agent/.sbx-token
 ## Everything, including Burp
 
 Burp Pro and the MCP bridge are staged on the host and mounted in — PortSwigger's download
-needs your account, so nothing here can fetch the jar for you. Download the **JAR** build from
-<https://portswigger.net/burp/releases/>, then:
+needs your account, so nothing here can fetch Burp for you. Download the **platform installer**
+matching your machine's architecture (`Linux (ARM)` on Apple Silicon, `Linux (x64)` on Intel)
+from <https://portswigger.net/burp/releases/>, then:
 
 ```console
-./kits/burp/stage-burp.sh --jar ~/Downloads/burpsuite_pro_v2026.8.jar
+./kits/burp/stage-burp.sh --installer ~/Downloads/burpsuite_linux_arm64_v2026_8.sh
 ```
+
+**Use the installer, not the standalone JAR.** The JAR's `chromium.properties` declares a
+browser build for every platform including `linuxarm64`, but the JAR only *contains*
+`chromium-{linux64,macosx64,win64}-*.zip`. Its `StandaloneJarChromiumBinaryInstaller` resolves
+that archive as a classpath resource inside the JAR — not a download — so on arm64 Burp's
+browser fails with no network traffic and nothing in the log. The platform installer takes the
+other code path and ships the arm64 Chromium (verified: `ELF 64-bit ARM aarch64`, 151.0.7922.137),
+plus PortSwigger's own JRE, which also silences the "your JRE appears to be … from Ubuntu"
+warning. `--jar` still works as a fallback and warns about the browser.
+
+The install runs unattended on first `burp-start.sh`, into `state/burp-install` — about 950 MB,
+paid once, and it survives `sbx rm` with the rest of the state mount.
 
 It prints the exact `sbx run` line, with your paths already substituted. Then:
 
@@ -71,6 +84,22 @@ JupyterLab uses it as its access token and the desktop as its VNC password. Note
 protocol truncates VNC passwords to **eight characters**, so the desktop is only ever protected
 by the first eight — which is why 6080 belongs on `127.0.0.1` and nowhere else. One token also
 means one leak exposes both services.
+
+## Ports: use `-p`, don't rely on the automatic ones
+
+Each kit declares its port, and sbx auto-publishes those on ephemeral host ports. Two measured
+reasons not to depend on them:
+
+They are **reallocated when the sandbox restarts** — one sandbox went from 49166/67/68 at
+create to 49169/70/71 after a stop/start, with the old numbers dead. Any bookmark goes stale.
+
+And they are published dual-stack (`protocol:` accepts only `tcp` or `udp` in a kit, never
+`tcp4`), so a service that binds IPv4-only inside the sandbox is unreachable over the `::1`
+half — and macOS tries `::1` first, so `localhost:<port>` fails while `127.0.0.1:<port>`
+works. Measured on this kit: Burp's own listener binds dual-stack and is fine either way,
+but websockify had to be given `[::]` explicitly to stop being IPv4-only.
+
+An explicit `-p 6080:6080` defaults to `tcp4`, which is stable and matches any listener.
 
 ## Egress is default-deny
 

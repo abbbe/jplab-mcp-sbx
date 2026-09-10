@@ -172,16 +172,28 @@ run_desktop() {
         x11vnc -display "$DISPLAY" -forever -shared -localhost \
                -rfbauth "$VNCDIR/passwd" -rfbport 5900
 
-    # WEBSOCKIFY GETS A BARE PORT, NOT 0.0.0.0.  sbx publishes a kit-declared
-    # port on BOTH address families, and macOS resolves localhost to ::1 first:
-    # a v4-only listener inside the sandbox means the host listener accepts and
-    # then forwards into nothing.  The bare port makes websockify's getaddrinfo
-    # run with AI_PASSIVE and bind the dual-stack wildcard instead.  This is the
-    # same reasoning as jupyter-svc.sh's --ip='*' (which is NOT 0.0.0.0 either).
-    # Verify with `ss -ltn`: want *:6080 or [::]:6080, never 0.0.0.0:6080.
+    # WEBSOCKIFY MUST BE GIVEN [::], NOT 0.0.0.0 AND NOT A BARE PORT.
+    #
+    # A kit-declared port is published on BOTH address families -- the schema
+    # accepts only "tcp" or "udp" there, never "tcp4" -- so sbx creates
+    # 127.0.0.1:<ephemeral> AND ::1:<ephemeral>.  macOS resolves localhost to
+    # ::1 first, so a v4-only listener in here means the host side accepts and
+    # then forwards into nothing.  Same class of bug as jupyter-svc.sh's
+    # --ip='*' (which is likewise NOT 0.0.0.0).
+    #
+    # A BARE PORT DOES NOT FIX IT, though it looks like it should: websockify's
+    # getaddrinfo picks the IPv4 wildcard.  Measured in a live sandbox --
+    # `websockify ... 6080` gives `0.0.0.0:6080` and no v6 socket at all, and
+    # curl to [::1]:6080 fails while 127.0.0.1:6080 returns 200.
+    #
+    # `[::]` binds one v6 socket that also accepts v4-mapped connections
+    # (bindv6only=0 in this image).  Measured on the same sandbox: `[::]:6081`
+    # shows a single `:::6081` listener and BOTH 127.0.0.1 and [::1] return 200.
+    # Note netstat shows only the tcp6 line for a dual-stack socket -- that is
+    # correct, not half a bind.
     echo "=== noVNC on :$NOVNC_PORT ==="
     keep_alive websockify \
-        websockify --web=/usr/share/novnc "$NOVNC_PORT" 127.0.0.1:5900
+        websockify --web=/usr/share/novnc "[::]:$NOVNC_PORT" 127.0.0.1:5900
 
     # Wait on the X server alone.  Everything above is replaceable while it lives.
     wait "$xvfb_pid"

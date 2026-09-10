@@ -24,18 +24,27 @@ KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${HOME}/.sbx/burp"
 BRIDGE_VERSION="2.8.0"
 JAR=""
+INSTALLER=""
 LICENSE_FILE=""
 TOKEN=""
 RESEED=0
 
 usage() {
     cat <<EOF
-Usage: $0 --jar PATH [options]
+Usage: $0 (--installer PATH | --jar PATH) [options]
        $0 --reseed [--root DIR]
 
-  --jar PATH             Burp Suite Professional JAR (required for staging).
-                         Download it from https://portswigger.net/burp/releases/
-                         -- log in, pick your version, platform "JAR".
+  --installer PATH       Burp Suite Professional PLATFORM INSTALLER (.sh) for
+                         the sandbox's architecture. PREFER THIS: it is the only
+                         flavour that carries Burp's embedded browser for arm64,
+                         and it bundles PortSwigger's own JRE. Download it from
+                         https://portswigger.net/burp/releases/ -- log in, pick
+                         your version, platform "Linux (ARM)" on Apple Silicon
+                         or "Linux (x64)" on an Intel host.
+  --jar PATH             Burp Suite Professional standalone JAR. Works, but its
+                         embedded browser is x64-only (the jar ships
+                         chromium-{linux64,macosx64,win64} and nothing for
+                         linuxarm64, despite declaring it in chromium.properties).
   --root DIR             Staging root (default: \$HOME/.sbx/burp)
   --bridge-version VER   fwaeytens/burp-mcp-bridge release (default: $BRIDGE_VERSION)
   --license-file FILE    File containing your Burp licence key (else prompted)
@@ -49,6 +58,7 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         --jar) JAR="${2:?}"; shift 2 ;;
+        --installer) INSTALLER="${2:?}"; shift 2 ;;
         --root) ROOT="${2:?}"; shift 2 ;;
         --bridge-version) BRIDGE_VERSION="${2:?}"; shift 2 ;;
         --license-file) LICENSE_FILE="${2:?}"; shift 2 ;;
@@ -109,19 +119,55 @@ if [ "$node_major" -lt 18 ] || { [ "$node_major" -eq 18 ] && [ "$node_minor" -lt
     die "node $(node -v) is too old; the bridge needs >= 18.14.1"
 fi
 
-[ -n "$JAR" ] || { usage >&2; echo >&2; die "--jar is required"; }
-[ -f "$JAR" ] || die "no such file: $JAR"
-
-# A truncated download or an HTML error page saved as a .jar is the classic
-# silent failure here, and it surfaces much later as "Burp will not start".
-unzip -p "$JAR" META-INF/MANIFEST.MF 2>/dev/null | grep -q 'Main-Class: *burp\.StartBurp' \
-    || die "$JAR does not look like a Burp jar (no Main-Class: burp.StartBurp)"
+[ -n "$JAR" ] || [ -n "$INSTALLER" ] || {
+    usage >&2; echo >&2; die "one of --installer (preferred) or --jar is required"; }
 
 mkdir -p "$ROOT/dist" "$ROOT/state/java"
 
-# --- Burp jar -------------------------------------------------------------
-echo "==> Burp jar"
-cp "$JAR" "$ROOT/dist/burpsuite_pro.jar"
+# The sandbox inherits the host's architecture, so the installer has to match
+# this machine, not the machine the licence was bought on.
+case "$(uname -m)" in
+    arm64|aarch64) WANT_ARCH=arm64 ;;
+    x86_64|amd64)  WANT_ARCH=x64 ;;
+    *)             WANT_ARCH="" ;;
+esac
+
+# --- Burp platform installer (preferred) ----------------------------------
+if [ -n "$INSTALLER" ]; then
+    echo "==> Burp platform installer"
+    [ -f "$INSTALLER" ] || die "no such file: $INSTALLER"
+    # install4j installers are shell scripts with a payload appended. A partial
+    # or wrong download surfaces much later as a hung install, so check now.
+    # -i because the marker in the header is the uppercase INSTALL4J_* variable
+    # names, not the lowercase product name.
+    head -c 2048 "$INSTALLER" | grep -qi 'install4j' \
+        || die "$INSTALLER does not look like an install4j installer"
+    case "$(basename "$INSTALLER")" in
+        *linux*|*Linux*) : ;;
+        *) echo "    WARNING: '$(basename "$INSTALLER")' does not look like a LINUX build;" >&2
+           echo "             the sandbox is Linux regardless of your host OS." >&2 ;;
+    esac
+    if [ "$WANT_ARCH" = arm64 ]; then
+        case "$(basename "$INSTALLER")" in
+            *arm64*|*aarch64*) : ;;
+            *) echo "    WARNING: this host is arm64 but '$(basename "$INSTALLER")' does not" >&2
+               echo "             look like an arm64 build. Burp will not start." >&2 ;;
+        esac
+    fi
+    cp "$INSTALLER" "$ROOT/dist/burp-installer.sh"
+    chmod +x "$ROOT/dist/burp-installer.sh"
+fi
+
+# --- Burp standalone jar (fallback) ---------------------------------------
+if [ -n "$JAR" ]; then
+    echo "==> Burp jar"
+    [ -f "$JAR" ] || die "no such file: $JAR"
+    # A truncated download or an HTML error page saved as a .jar is the classic
+    # silent failure here, and it surfaces later as "Burp will not start".
+    unzip -p "$JAR" META-INF/MANIFEST.MF 2>/dev/null | grep -q 'Main-Class: *burp\.StartBurp' \
+        || die "$JAR does not look like a Burp jar (no Main-Class: burp.StartBurp)"
+    cp "$JAR" "$ROOT/dist/burpsuite_pro.jar"
+fi
 
 # --- MCP bridge: extension jar + node bridge ------------------------------
 # Both are public GitHub release artefacts, so unlike the Burp jar these CAN be
@@ -171,7 +217,9 @@ fi
 chmod 600 "$ROOT/dist/license.key"
 
 # --- manifest -------------------------------------------------------------
-( cd "$ROOT/dist" && sha256 burpsuite_pro.jar burp-mcp-bridge.jar > MANIFEST.sha256 )
+( cd "$ROOT/dist" && sha256 burp-mcp-bridge.jar \
+    $([ -f burpsuite_pro.jar ] && echo burpsuite_pro.jar) \
+    $([ -f burp-installer.sh ] && echo burp-installer.sh) > MANIFEST.sha256 )
 
 # --- what to run ----------------------------------------------------------
 REPO_ROOT="$(cd "$KIT_DIR/../.." && pwd)"
@@ -182,7 +230,8 @@ tokarg=""
 cat <<EOF
 
 Staged into $ROOT  (bridge $BRIDGE_VERSION)
-    dist/burpsuite_pro.jar      $(du -h "$ROOT/dist/burpsuite_pro.jar" | cut -f1)
+$([ -f "$ROOT/dist/burp-installer.sh" ] && printf '    dist/burp-installer.sh      %s (installed on first burp-start.sh)' "$(du -h "$ROOT/dist/burp-installer.sh" | cut -f1)")
+$([ -f "$ROOT/dist/burpsuite_pro.jar" ] && printf '    dist/burpsuite_pro.jar      %s' "$(du -h "$ROOT/dist/burpsuite_pro.jar" | cut -f1)")
     dist/burp-mcp-bridge.jar    $(du -h "$ROOT/dist/burp-mcp-bridge.jar" | cut -f1)
     dist/bridge/                node bridge with node_modules
     dist/license.key            (0600)
@@ -199,7 +248,13 @@ Create the sandbox with:
     --kit-arg sbx-burp.dist=$ROOT/dist \\
     --kit-arg sbx-burp.state=$ROOT/state$tokarg \\
     -m 8g \\
-    -p 8888:8888 -p 6080:6080 -p 8080:8080
+    -p 8888:8888 -p 6080:6080 -p 18080:8080
+
+The sandbox's Burp proxy is published on host port 18080, NOT 8080: anyone using
+this kit very likely has a Burp of their own already listening on 127.0.0.1:8080,
+and sbx fails the whole create with "address already in use" rather than picking
+another port. Point external clients at 127.0.0.1:18080. Inside the sandbox the
+listener is still on 8080, so via-burp and the proxied Jupyter kernel are unaffected.
 
 Then, inside it:
     sbx exec burpbox desktopctl url          # noVNC URL and password
