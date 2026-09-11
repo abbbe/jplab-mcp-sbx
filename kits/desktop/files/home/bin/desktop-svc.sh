@@ -1,31 +1,48 @@
 #!/usr/bin/env bash
-# The desktop: Xvfb, a window manager, a VNC server, and noVNC in front of it.
+# The desktop: one X server that speaks RFB natively, a window manager, and
+# noVNC in front of it.
 #
-# Ported from abbbe/sbx-workspace bin/svc/novnc.sh. Four things in here were
-# each paid for with an evening; every one of them is commented where it sits,
-# and none of them should be "cleaned up".
+# Descended from abbbe/sbx-workspace bin/svc/novnc.sh by way of an Xvfb+x11vnc
+# version of this file.  That pairing worked, but it could not resize: Xvfb's
+# framebuffer ceiling is welded on at startup by -screen, and x11vnc has no
+# SetDesktopSize hook at all -- libvncserver carries the protocol machinery,
+# the x11vnc binary has no matching symbol -- so a viewer asking for a
+# different size was simply refused.  The desktop was 1920x1080 and you scaled
+# it in the browser and squinted.  TigerVNC's Xvnc is the same X server and the
+# VNC server in one process, honours SetDesktopSize, and reports a RandR
+# maximum of 32768x32768, so the browser window drives the desktop size and
+# there is no ceiling to pick in advance.
 #
-# FOUR PROCESSES, ONE SERVICE, AND EACH OF THE THREE REPLACEABLE ONES IS KEPT
-# ALIVE INDEPENDENTLY.  Only Xvfb is fatal: everything else draws on it or
-# forwards it, so if one of those dies it is restarted in place and nobody else
-# hears about it.  An earlier version supervised only Xvfb, and the result was
-# the worst kind of failure -- x11vnc would die, the service still looked
-# "running" because the supervisor was alive, the noVNC page still loaded
-# because websockify serves it, and the browser said "Failed to connect to
-# server" with nothing anywhere explaining why.  A service is only up if the
-# thing it exists to do still works.
+# THREE PROCESSES, ONE SERVICE, AND THE TWO REPLACEABLE ONES ARE KEPT ALIVE
+# INDEPENDENTLY.  Only Xvnc is fatal: the window manager and the websocket
+# bridge both draw on it or forward it, so if one of those dies it is restarted
+# in place and nobody else hears about it.  An earlier version supervised only
+# the X server, and the result was the worst kind of failure -- the VNC half
+# would die, the service still looked "running" because the supervisor was
+# alive, the noVNC page still loaded because websockify serves it, and the
+# browser said "Failed to connect to server" with nothing anywhere explaining
+# why.  A service is only up if the thing it exists to do still works.  Folding
+# the VNC server into the X server removes that failure mode by construction:
+# there is no longer a VNC half that can die on its own.
 #
 # WHY -ac, AND WHY THAT IS NOT AS ALARMING AS IT LOOKS.  Access control is off so
 # that an X client in a DIFFERENT CONTAINER -- a pinned toolchain image, say,
 # started with `-v /tmp/.X11-unix:/tmp/.X11-unix -e DISPLAY=:1` -- can draw here
 # without sharing a cookie file across containers.  What makes that safe is the
-# pairing with -nolisten tcp: the server has no network socket at all, so the
-# only way in is the unix socket you deliberately bind-mount.  x11vnc still
-# binds loopback only and still demands the password.  Do not add TCP listening
-# to this without removing -ac in the same edit.
+# pairing with -nolisten tcp: the server has no X network socket at all, so the
+# only way in is the unix socket you deliberately bind-mount.  Measured on
+# Xvnc 1.15: with -nolisten tcp it listens on 5900 and nothing else, and it
+# still creates /tmp/.X11-unix/X1 exactly as Xvfb did.  The RFB port is
+# loopback-only and still demands the password.  Do not add TCP listening to
+# this without removing -ac in the same edit.
 set -uo pipefail
 
 : "${DISPLAY:=:1}"
+# The size the desktop STARTS at, not the size it is stuck with.  A viewer that
+# supports SetDesktopSize -- noVNC with resize=remote, any current native
+# client -- replaces this the moment it connects.  It still matters for
+# anything that runs before a human shows up: the agent starting a GUI
+# headlessly, screenshots, `desktopctl resize`.
 : "${VNC_GEOMETRY:=1920x1080}"
 : "${VNC_DEPTH:=24}"
 : "${NOVNC_PORT:=6080}"
@@ -34,15 +51,14 @@ export DISPLAY
 
 # WAYLAND_DISPLAY MUST BE UNSET, AND THIS IS NOT A WORKAROUND -- it is a lie
 # being corrected.  An sbx sandbox exports WAYLAND_DISPLAY=wayland-0 into every
-# process, and x11vnc 0.9.17 treats that variable alone as proof of a Wayland
-# session: it prints "Wayland display server detected ... Exiting" and returns 1
-# WITHOUT EVER LOOKING AT -display, even though the display it was handed is a
-# perfectly real Xvfb.  Measured by flipping one variable both ways;
-# XDG_SESSION_TYPE=wayland does NOT trigger it, so this is the whole cause.
-#
-# What that produced before it was found: x11vnc exiting 1 in a restart loop
-# forever, nothing on 5900, the noVNC page still served by websockify, and
-# "Failed to connect to server" in the browser as the only symptom.
+# process, and some X clients treat that variable alone as proof of a Wayland
+# session without ever looking at $DISPLAY.  x11vnc 0.9.17 did exactly that --
+# it printed "Wayland display server detected ... Exiting" and returned 1
+# against a perfectly real X display -- which cost an evening before it was
+# found.  Xvnc itself does NOT sniff the variable (measured: it starts fine
+# with it set), so this line no longer protects the service.  It stays because
+# it is inherited by fluxbox and by every GUI program started on this display,
+# which is where the lie still does damage.
 unset WAYLAND_DISPLAY
 export XDG_SESSION_TYPE=x11
 
@@ -52,9 +68,9 @@ mkdir -p "$VNCDIR" "$STATE"
 
 # ONE TOKEN PER SANDBOX, shared with every other kit in this repo. Whichever
 # kit's install step ran first created it.  Note the RFB protocol truncates the
-# password to 8 characters and throws the rest away -- x11vnc -storepasswd does
-# that itself -- so the desktop is only ever protected by the first 8, which is
-# why its port belongs on 127.0.0.1 and nowhere else.
+# password to 8 characters and throws the rest away -- vncpasswd does that
+# itself, silently -- so the desktop is only ever protected by the first 8,
+# which is why its port belongs on 127.0.0.1 and nowhere else.
 TOKEN_FILE=${SBX_TOKEN_FILE:-$HOME/.sbx-token}
 if [[ ! -s "$TOKEN_FILE" ]]; then
     echo "!!! $TOKEN_FILE is missing or empty; refusing to start an unauthenticated desktop" >&2
@@ -76,7 +92,7 @@ fi
 
 # keep_alive NAME COMMAND...
 #     Restart one replaceable component for as long as the display lives.  It
-#     stops when Xvfb does, so the outer loop gets a clean exit rather than a
+#     stops when Xvnc does, so the outer loop gets a clean exit rather than a
 #     pile of orphans respawning against a dead display.
 #
 # THE LOOP WAITS ON THE PROCESS, NEVER ON A PIPELINE.  Writing the prefixer as
@@ -98,7 +114,7 @@ keep_alive() {
     rm -f "$fifo"
     mkfifo -m 600 "$fifo"
 
-    # The component's own output goes into the service log, prefixed so three
+    # The component's own output goes into the service log, prefixed so the
     # interleaved streams stay readable.  An earlier version sent it to
     # /dev/null, which meant a component that could not start at all reported
     # only "exited rc=1; restarting" forever -- the supervisor saying THAT it
@@ -110,22 +126,67 @@ keep_alive() {
         # fd 3 stays open for the whole loop, so the prefixer never sees EOF
         # between restarts and never needs restarting itself.
         exec 3>"$fifo"
-        while kill -0 "$xvfb_pid" 2>/dev/null; do
+        while kill -0 "$xserver_pid" 2>/dev/null; do
             "$@" >&3 2>&3
             rc=$?
-            kill -0 "$xvfb_pid" 2>/dev/null || break
+            kill -0 "$xserver_pid" 2>/dev/null || break
             echo "[desktop] $name exited rc=$rc; restarting"
             sleep 2
         done
     ) &
 }
 
-# One full life of the desktop: bring up Xvfb, hang the other three off it, and
-# return when Xvfb dies.  The outer loop below decides whether to try again.
+# One full life of the desktop: bring up Xvnc, hang the other two off it, and
+# return when Xvnc dies.  The outer loop below decides whether to try again.
 run_desktop() {
-    echo "=== Xvfb on $DISPLAY (${VNC_GEOMETRY}x${VNC_DEPTH}) ==="
-    Xvfb "$DISPLAY" -screen 0 "${VNC_GEOMETRY}x${VNC_DEPTH}" -ac -nolisten tcp &
-    xvfb_pid=$!
+    # THE PASSWORD FILE MUST EXIST BEFORE THE SERVER STARTS, which is the one
+    # ordering difference from the x11vnc version -- there, the VNC server was a
+    # separate process started after the display and could be handed its
+    # password at that point.  Xvnc reads -rfbauth during its own startup, so a
+    # missing file is a fatal server error rather than a failed component.
+    #
+    # vncpasswd -f reads the plaintext on stdin and writes the obfuscated form
+    # on stdout.  Measured: it accepts a token longer than 8 characters without
+    # a word of complaint, truncates it, and produces a file BYTE-IDENTICAL to
+    # the one `x11vnc -storepasswd` used to write -- so this is a drop-in swap
+    # and an existing ~/.vnc/passwd keeps working.
+    # The subshell scopes the umask: set bare, it would be inherited by fluxbox,
+    # by websockify, and by every GUI program started on this display for the
+    # rest of the service's life.  And note the redirection does NOT merge
+    # stderr -- `> file 2>&1` here would write any warning vncpasswd ever prints
+    # INTO the password file, corrupting it in a way that reads as a wrong
+    # password.  Its stderr belongs in the service log with everything else.
+    ( umask 077; printf '%s\n' "$(cat "$TOKEN_FILE")" | vncpasswd -f > "$VNCDIR/passwd" )
+    chmod 600 "$VNCDIR/passwd" 2>/dev/null
+    if [[ ! -s "$VNCDIR/passwd" ]]; then
+        # Never fall back to -SecurityTypes None: a desktop that quietly stops
+        # requiring a password because its password file failed to write is
+        # worse than one that does not start.
+        echo "!!! $VNCDIR/passwd is missing or empty; refusing to start" >&2
+        return 1
+    fi
+
+    echo "=== Xvnc on $DISPLAY (${VNC_GEOMETRY}x${VNC_DEPTH}), RFB on 127.0.0.1:5900 ==="
+    # -AcceptSetDesktopSize is the entire point of this kit's TigerVNC rebuild:
+    #   it is what lets the browser window drive the desktop size.  It defaults
+    #   to on; it is spelled out here so nobody "cleans up" the flag that makes
+    #   resizing work.
+    # -AlwaysShared reproduces x11vnc's -shared.  Without it TigerVNC's default
+    #   DisconnectClients kicks the existing viewer off when a second one
+    #   connects, which for a desktop you might have open in two tabs reads as a
+    #   random disconnect.
+    # -MaxIdleTime/-MaxDisconnectionTime/-MaxConnectionTime all default to 0
+    #   already.  They are pinned because every one of them is a timer that
+    #   TERMINATES THE SERVER, and a non-zero default arriving in some future
+    #   version would show up as a desktop that mysteriously dies overnight.
+    Xvnc "$DISPLAY" \
+        -geometry "$VNC_GEOMETRY" -depth "$VNC_DEPTH" \
+        -rfbport 5900 -localhost \
+        -SecurityTypes VncAuth -rfbauth "$VNCDIR/passwd" \
+        -AcceptSetDesktopSize=1 -AlwaysShared \
+        -MaxIdleTime=0 -MaxDisconnectionTime=0 -MaxConnectionTime=0 \
+        -desktop "sbx" -ac -nolisten tcp &
+    xserver_pid=$!
 
     # Wait for the server to accept clients rather than sleeping a guessed
     # interval.  A GUI started against a not-yet-listening display fails in ways
@@ -136,41 +197,16 @@ run_desktop() {
         sleep 0.25
     done
     if ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
-        echo "!!! Xvfb never accepted a connection on $DISPLAY" >&2
-        kill "$xvfb_pid" 2>/dev/null
+        echo "!!! Xvnc never accepted a connection on $DISPLAY" >&2
+        kill "$xserver_pid" 2>/dev/null
         return 1
     fi
     echo "=== display ready ==="
-
-    # x11vnc wants the password in a file rather than on the command line, where
-    # it would be visible in ps to every process in the sandbox.
-    #
-    # -quiet is deliberately NOT used.  It suppresses fatal startup errors and
-    # not merely per-connection chatter: with -quiet, the Wayland refusal above
-    # prints NOTHING AT ALL and x11vnc just exits 1.  Measured.  Per-connection
-    # noise is worth paying for a log that says why a service will not start.
-    x11vnc -storepasswd "$(cat "$TOKEN_FILE")" "$VNCDIR/passwd" 2>&1 | sed "s/^/[storepasswd] /"
-    chmod 600 "$VNCDIR/passwd" 2>/dev/null
-    if [ ! -s "$VNCDIR/passwd" ]; then
-        # -rfbauth against a missing or empty file fails on every attempt, which
-        # looks identical to the Wayland failure from outside.  Say which it is.
-        # Never fall back to -nopw: a desktop that quietly stops requiring a
-        # password because its password file failed to write is worse than one
-        # that does not start.
-        echo "!!! $VNCDIR/passwd is missing or empty; x11vnc cannot authenticate" >&2
-        kill "$xvfb_pid" 2>/dev/null
-        return 1
-    fi
 
     xsetroot -solid grey20 2>/dev/null || true
 
     echo "=== window manager ==="
     keep_alive fluxbox fluxbox
-
-    echo "=== x11vnc (loopback only, password required) ==="
-    keep_alive x11vnc \
-        x11vnc -display "$DISPLAY" -forever -shared -localhost \
-               -rfbauth "$VNCDIR/passwd" -rfbport 5900
 
     # WEBSOCKIFY MUST BE GIVEN [::], NOT 0.0.0.0 AND NOT A BARE PORT.
     #
@@ -196,8 +232,8 @@ run_desktop() {
         websockify --web=/usr/share/novnc "[::]:$NOVNC_PORT" 127.0.0.1:5900
 
     # Wait on the X server alone.  Everything above is replaceable while it lives.
-    wait "$xvfb_pid"
-    echo "!!! Xvfb exited -- the desktop is gone" >&2
+    wait "$xserver_pid"
+    echo "!!! Xvnc exited -- the desktop is gone" >&2
     return 0
 }
 

@@ -46,11 +46,29 @@ port_open() { timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
 # --- 1. Refuse to double-start -------------------------------------------
 # A second Burp loses the race for port 8080 and reports it as its own failure,
 # which reads as "Burp is broken" rather than "Burp is already running".
-# The bracket in the pattern stops pgrep matching the shell that is running this
-# very script -- its own command line contains the pattern otherwise. Matches
-# both flavours: the standalone jar and an install4j BurpSuitePro launcher.
-if pid=$(pgrep -f '[b]urpsuite_pro\.jar|[B]urpSuite' | head -1) && [ -n "$pid" ]; then
-    echo "Burp is already running (pid $pid)."
+#
+# THE PORT IS THE AUTHORITY HERE, NOT THE PROCESS TABLE.  This was a pgrep
+# alone, matching '[b]urpsuite_pro\.jar|[B]urpSuite' -- and it MISSED the
+# flavour this kit goes out of its way to prefer.  An install4j launcher execs
+# its bundled JRE, so the launcher's own name is gone from argv by the time
+# anything can look for it.  Measured on a live sandbox, with Burp holding both
+# ports, the process is:
+#   .../state/burp-install/jre/bin/java -splash:.../.install4j/... --add-opens ...
+# and BOTH old patterns scored zero.  So the one guard whose job is to stop a
+# second Burp never fired for an installer-based Burp at all.
+#
+# Contending for the port is the actual failure mode, so test the port.  pgrep
+# survives only to name a pid in the message, with the install directory this
+# script itself chooses ($STATE/burp-install) added to the pattern.  The
+# brackets stop pgrep matching the shell running this very script, whose own
+# command line would otherwise contain the pattern.
+if port_open "$PROXY_PORT"; then
+    pid=$(pgrep -f '[b]urpsuite_pro\.jar|[B]urpSuite|[b]urp-install' | head -1)
+    if [ -n "$pid" ]; then
+        echo "Burp is already running (pid $pid)."
+    else
+        echo "Something already holds port $PROXY_PORT; not starting a second Burp."
+    fi
     echo "  proxy :$PROXY_PORT  bridge api :$API_PORT   log: $LOG"
     exit 0
 fi
@@ -239,8 +257,20 @@ done
 # Once accepted, `burp.eula` lands in the prefs store -- which lives on the
 # state mount -- so this branch is taken exactly once per staging directory,
 # not once per sandbox.
-PREFS="$HOME/.java/.userPrefs/burp/prefs.xml"
-if ! grep -q 'burp\.eula' "$PREFS" 2>/dev/null; then
+# DO NOT HARDCODE THE PREFS PATH.  An earlier version probed
+# $HOME/.java/.userPrefs/burp/prefs.xml, which is where the JDK default and
+# -Djava.util.prefs.userRoot both say it should be -- and it is where the
+# INSTALLER's own prefs land ($STATE/java/.userPrefs/com/install4j/...).  Burp
+# itself writes ONE LEVEL DEEPER: measured, the accepted EULA is at
+# $STATE/java/.java/.userPrefs/burp/prefs.xml, so the two JVMs involved disagree
+# about the root and the hardcoded path matched neither reliably.
+#
+# The cost of getting this wrong is invisible and permanent: the probe fails
+# forever, so EVERY start takes the interactive first-run branch below, sits in
+# the foreground streaming Burp's log to the terminal, and waits for an EULA
+# prompt that will never come because Burp is already licensed.  Searching the
+# prefs tree for the key is immune to which root the JRE picked.
+if ! grep -rq --include=prefs.xml 'burp\.eula' "$HOME/.java" 2>/dev/null; then
     if [ ! -t 0 ]; then
         cat >&2 <<EOF
 burp-start: this is Burp's first run against $STATE/java, and it will ask you to
@@ -261,11 +291,22 @@ EOF
     echo "[burp-start] first run: answer the EULA and licence prompts below."
     echo "[burp-start] licence key: $DIST/license.key"
     echo
+
+    # THE REDIRECT IS SET UP BEFORE THE exec, NOT PIPED INTO IT.  Written the
+    # obvious way -- `exec "${BURP[@]}" ... 2>&1 | tee -a "$LOG"` -- the exec is
+    # one element of a PIPELINE, so it replaces the subshell bash forked for that
+    # element and NOT this script.  The script then survives Burp, falls through
+    # to the detached launch in step 7, and starts a SECOND Burp the moment the
+    # foreground one exits or is interrupted.  Measured: ^C on the first run
+    # printed "launching Burp" and brought up another instance.
+    #
+    # Process substitution keeps the log without putting exec in a pipeline, so
+    # this really is the last thing the script does.
+    exec > >(tee -a "$LOG") 2>&1
     exec "${BURP[@]}" \
         --project-file="$STATE/project.burp" \
         --config-file="$STATE/project-config.json" \
-        --user-config-file="$STATE/user-config.json" \
-        2>&1 | tee -a "$LOG"
+        --user-config-file="$STATE/user-config.json"
 fi
 
 # --- 7. Launch detached ---------------------------------------------------

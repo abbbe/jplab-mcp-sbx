@@ -2,8 +2,10 @@ schemaVersion: "2"
 kind: mixin
 name: sbx-desktop
 version: "0.1.0"
-displayName: Virtual desktop (Xvfb + noVNC)
-description: An X display, a window manager, and noVNC in front of it. Nothing else starts here.
+displayName: Virtual desktop (TigerVNC + noVNC)
+description: >-
+  A resizable X display, a window manager, and noVNC in front of it. The desktop
+  follows the browser window. Nothing else starts here.
 requires:
   agent: claude
 
@@ -22,6 +24,14 @@ environment:
     # instead.  Exporting it sandbox-wide is the point: any GUI program started
     # by hand or by the agent lands on the virtual display without ceremony.
     DISPLAY: ":1"
+    # THE SIZE THE DESKTOP STARTS AT, NOT THE SIZE IT IS STUCK WITH.  Under the
+    # old Xvfb+x11vnc pairing this was a ceiling: Xvfb welds its framebuffer
+    # maximum on at startup, so 1920x1080 here meant 1920x1080 forever and the
+    # browser could only scale it.  Xvnc reports a RandR maximum of
+    # 32768x32768 and accepts SetDesktopSize, so any viewer that asks for a
+    # different size gets it.  This value still governs everything that happens
+    # before a viewer connects -- a GUI the agent starts headlessly, a
+    # screenshot -- and `desktopctl resize WxH` sets it by hand.
     VNC_GEOMETRY: "1920x1080"
     VNC_DEPTH: "24"
     NOVNC_PORT: "6080"
@@ -46,10 +56,12 @@ ports:
   - container: 6080
     protocol: tcp
     name: novnc
-  # 5900 is deliberately absent.  x11vnc binds loopback only, and the RFB
-  # protocol truncates its password to 8 characters -- publishing that port
-  # would offer a remote desktop to anything that can reach the host, behind
-  # eight characters.
+  # 5900 is deliberately absent.  Xvnc is started with -localhost so it binds
+  # loopback only, and the RFB protocol truncates its password to 8 characters
+  # -- publishing that port would offer a remote desktop to anything that can
+  # reach the host, behind eight characters.  Publish it by hand (-p
+  # 127.0.0.1:5900:5900) if you want a native viewer, and understand that the
+  # eight characters are all that is between it and the host.
 
 setup:
   install:
@@ -93,20 +105,36 @@ setup:
     #   does NOT prevent it.  That dialog is also what exposed the pipeline bug
     #   documented in desktop-svc.sh's keep_alive.
     #
+    #   tigervnc-tools and xfonts-base are BOTH ONLY Recommends of
+    #   tigervnc-standalone-server, and this install runs with
+    #   --no-install-recommends, so neither arrives unless it is named here.
+    #   Leaving them out fails in two different unhelpful ways: without
+    #   tigervnc-tools there is no vncpasswd, so the service cannot write a
+    #   password file and refuses to start; without xfonts-base Xvnc cannot open
+    #   the core font "fixed" and dies during its own startup, before anything
+    #   in this kit gets a chance to report it.  libgl1-mesa-dri is a third
+    #   Recommends of the same package and is already named below for its own
+    #   reasons.
+    #
     # libgl1-mesa-dri is not optional either even though nothing links it at
     # build time: without the DRI drivers an OpenGL canvas on a software X
     # server either falls back to an unaccelerated path or fails outright, and
     # the application reports it as its own bug.  mesa-utils also supplies
     # glxgears, which is the right way to verify the display -- xdpyinfo
-    # succeeds over connections a real GUI cannot use.
+    # succeeds over connections a real GUI cannot use.  Measured on Xvnc 1.15
+    # against the Xvfb it replaced: identical GLX, both `direct rendering: Yes`
+    # on llvmpipe at GL 4.5, and glxgears renders on both.  TigerVNC shipped
+    # Xvnc without GLX for years -- that is why TurboVNC pairs with VirtualGL --
+    # so this is worth re-checking, not assuming, on a version bump.
     - user: "0"
-      description: X server, window manager, VNC, noVNC
+      description: X server (TigerVNC), window manager, noVNC
       command: |
         set -e
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
         apt-get install -y --no-install-recommends \
-          xvfb x11vnc novnc websockify fluxbox \
+          tigervnc-standalone-server tigervnc-tools xfonts-base \
+          novnc websockify fluxbox \
           feh xterm \
           x11-utils x11-xserver-utils xauth dbus-x11 \
           libgl1-mesa-dri mesa-utils \
@@ -138,13 +166,23 @@ agentInstructions:
   content: |
     ## Virtual desktop
 
-    A 1920x1080 X display is on `:1`, mirrored to noVNC on port 6080. GUI
-    programs you start (`xterm &`) appear there; the human opens the URL from
-    `desktopctl url` in a browser. Only the first 8 characters of the password
-    matter -- the RFB protocol truncates it.
+    An X display is on `:1`, served by TigerVNC's Xvnc and reachable through
+    noVNC on port 6080. GUI programs you start (`xterm &`) appear there; the
+    human opens the URL from `desktopctl url` in a browser. Only the first 8
+    characters of the password matter -- the RFB protocol truncates it.
+
+    **The desktop has no fixed size.** It starts at `$VNC_GEOMETRY` and then
+    follows whatever the connected viewer asks for, so do not assume 1920x1080
+    and do not hard-code a geometry. Read the current size with `xdpyinfo |
+    grep dimensions` (or `desktopctl status`, which prints it) at the moment
+    you need it. When nothing is connected -- you started a GUI headlessly, or
+    you want a screenshot at a known size -- set it with `desktopctl resize
+    2560x1440`; a viewer that connects later will override it, which is
+    correct.
 
     `desktopctl status` probes 5900 and 6080 separately, because a live
-    supervisor with a dead x11vnc still serves the noVNC page: the browser then
+    supervisor with a dead websockify still leaves the display running, and a
+    dead display still leaves the noVNC page being served: the browser then
     says "Failed to connect to server" and nothing else reports a problem.
 
     If a GUI program refuses to start claiming a Wayland session, `unset

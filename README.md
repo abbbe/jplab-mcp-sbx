@@ -8,7 +8,7 @@ JupyterLab is there for scripting.
 | kit | what it adds | port | starts |
 |---|---|---|---|
 | [`kits/jupyter`](kits/jupyter) | JupyterLab with RTC + `jupyter-mcp-server` over stdio | 8888 | automatically |
-| [`kits/desktop`](kits/desktop) | Xvfb + fluxbox + x11vnc + noVNC | 6080 | automatically |
+| [`kits/desktop`](kits/desktop) | TigerVNC (Xvnc) + fluxbox + noVNC, resizes to the browser | 6080 | automatically |
 | [`kits/burp`](kits/burp) | Burp Suite Pro + [`burp-mcp-bridge`](https://github.com/fwaeytens/burp-mcp-bridge) | 8080 | on demand |
 
 Kits are composed at **create** time — `sbx kit add` on a running sandbox silently skips
@@ -74,6 +74,49 @@ Burp's first run is a console conversation, not a GUI wizard: it prints the EULA
 stdin, so it needs a terminal — that is why the command above uses `sbx exec -it`.
 `dist/license.key` is at the same path inside the sandbox, so you can `cat` it there and paste. After that the activation lives in `state/java` on the host
 and survives `sbx rm`.
+
+## The desktop follows your browser window
+
+Open the noVNC URL and the desktop sizes itself to the browser window, at 1:1 pixels — no
+scaling, no letterboxing, no scrollbars. Resize the window and it follows.
+
+That comes from two halves that both have to be right. The URL carries `?resize=remote`, which
+is the noVNC setting that makes the client ask for a size rather than scale what it is given;
+`sbx-kits urls` and `desktopctl url` both print it that way. The other half is the server:
+`kits/desktop` runs TigerVNC's **Xvnc**, which is the X server and the VNC server in one
+process, started with `-AcceptSetDesktopSize=1`.
+
+It used to run Xvfb with x11vnc in front, and that pairing *cannot* do this. Xvfb welds its
+framebuffer maximum on at startup — `xrandr` on the old stack reported `maximum 1920 x 1080`
+against `maximum 32768 x 32768` on Xvnc — and x11vnc has no SetDesktopSize hook at all, so a
+viewer asking for a different size was simply refused. All you could do was scale in the
+browser and squint.
+
+`$VNC_GEOMETRY` (default 1920x1080) is now only the size the desktop *starts* at, for whatever
+happens before a viewer connects. When nothing is attached — a GUI the agent started headlessly,
+a screenshot that has to come out at a known size — set it by hand:
+
+```console
+sbx exec burpbox /home/agent/bin/desktopctl resize 2560x1440
+sbx exec burpbox /home/agent/bin/desktopctl status     # prints the current size
+```
+
+A viewer that connects later will override that, which is the right precedence: the viewer wins
+when there is a viewer.
+
+**A native client works too**, and gets the same dynamic resize, because Xvnc speaks RFB
+directly. 5900 is not published, and that is deliberate — the RFB protocol truncates the
+password to eight characters, so an exposed 5900 is a remote desktop behind eight characters.
+`sbx-kits` has no flag for it on purpose. To do it anyway, take the command the wrapper would
+have run and add the mapping yourself, loopback-only:
+
+```console
+./bin/sbx-kits up burpbox --dry-run      # prints the full sbx run line
+<that line> -p 127.0.0.1:5900:5900       # then point a VNC viewer at localhost:5900
+```
+
+macOS's own Screen Sharing.app will connect but will not resize — it does not send
+SetDesktopSize. A TigerVNC or RealVNC viewer does.
 
 ## One token
 

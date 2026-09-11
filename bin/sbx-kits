@@ -195,7 +195,7 @@ print_urls() {
     load_token
     cat <<EOF
 
-  noVNC       http://127.0.0.1:$PORT_NOVNC/vnc.html   password: $(printf '%s' "$TOKEN" | cut -c1-8)
+  noVNC       http://127.0.0.1:$PORT_NOVNC/vnc.html?resize=remote   password: $(printf '%s' "$TOKEN" | cut -c1-8)
   JupyterLab  http://127.0.0.1:$PORT_JUPYTER/lab?token=$TOKEN
 EOF
     has_kit burp && echo "  Burp proxy  127.0.0.1:$PORT_BURP  (sandbox-side listener is 8080)"
@@ -203,7 +203,8 @@ EOF
 
 The VNC password is the FIRST 8 CHARACTERS only -- the RFB protocol truncates it
 and throws the rest away, which is why these are bound to 127.0.0.1 and nowhere
-else.
+else.  resize=remote on the noVNC URL is what makes the desktop follow the
+browser window instead of being scaled to fit it.
 EOF
 }
 
@@ -252,7 +253,16 @@ up)
     # --detached at CREATE is the auto-stop fix: without it the sandbox stops 30
     # seconds after the last session disconnects, which kills anything you are
     # using from a browser.
-    CMDLINE=(sbx run --detached claude --name "$NAME" "$WORKSPACE" "${MOUNTS[@]}"
+    # "${MOUNTS[@]+...}" RATHER THAN "${MOUNTS[@]}".  MOUNTS is only populated by
+    # the burp kit, and under `set -u` bash treats an unset-or-empty array
+    # expansion as an unbound variable -- so ANY invocation without that kit
+    # (`--kits desktop`, the very path someone using only this repo's desktop
+    # would take) died with "MOUNTS[@]: unbound variable" before printing
+    # anything useful.  The +alternate form expands to nothing when the array is
+    # empty instead of erroring.  Same reasoning would apply to KIT_ARGS and
+    # PUBLISH if either could ever be empty; neither can, so both are left plain.
+    CMDLINE=(sbx run --detached claude --name "$NAME" "$WORKSPACE"
+             ${MOUNTS[@]+"${MOUNTS[@]}"}
              "${KIT_ARGS[@]}" -m "$MEMORY")
     [ -n "$CPUS" ] && CMDLINE+=(--cpus "$CPUS")
     CMDLINE+=("${PUBLISH[@]}")
@@ -282,7 +292,7 @@ status)
     sbx ls 2>/dev/null | awk -v n="$NAME" 'NR==1 || $1==n'
     echo
     sbx exec "$NAME" bash -lc '
-        for p in 8888:jupyterlab 6080:novnc 5900:x11vnc 8080:burp-proxy 8081:burp-mcp; do
+        for p in 8888:jupyterlab 6080:novnc 5900:xvnc 8080:burp-proxy 8081:burp-mcp; do
             port=${p%%:*}; name=${p##*:}
             if timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
                 printf "  %-12s %-5s up\n" "$name" "$port"
@@ -299,7 +309,12 @@ down)    exec sbx stop "$NAME" ;;
 destroy)
     require_sandbox
     printf "Remove sandbox '%s'? Host-staged Burp state in %s is NOT touched. [y/N] " "$NAME" "$BURP_ROOT"
-    read -r a; case "$a" in y|Y) sbx rm "$NAME" ;; *) echo "aborted" ;; esac
+    # -f because THIS prompt is the confirmation.  `sbx rm` without it asks its
+    # own "This cannot be undone" question, so the user answers twice for one
+    # decision -- and the second prompt is the less informative of the two: it
+    # cannot know that the Burp state mount survives.  Keep the prompt that says
+    # something, suppress the one that does not.
+    read -r a; case "$a" in y|Y) sbx rm -f "$NAME" ;; *) echo "aborted" ;; esac
     ;;
 
 *) die "unknown command: $CMD (try --help)" ;;
