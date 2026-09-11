@@ -1,4 +1,4 @@
-# sbx kits: JupyterLab, a desktop, and Burp Suite Pro
+# sbx-kits: JupyterLab, a desktop, and Burp Suite Pro
 
 Three mixin kits for [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (`sbx`),
 composed onto the stock `claude` agent. Each one works alone; together they give a sandbox
@@ -20,7 +20,7 @@ Kits are composed at **create** time — `sbx kit add` on a running sandbox sile
 token, and fixed host ports.
 
 ```console
-git clone https://github.com/abbbe/jplab-mcp-sbx ~/.sbx/sbx-kits
+git clone https://github.com/abbbe/sbx-kits ~/.sbx/sbx-kits
 ~/.sbx/sbx-kits/bin/sbx-kits up            # creates a sandbox named after $PWD
 ~/.sbx/sbx-kits/bin/sbx-kits status        # sandbox state + per-service health
 ~/.sbx/sbx-kits/bin/sbx-kits urls          # URLs and token again
